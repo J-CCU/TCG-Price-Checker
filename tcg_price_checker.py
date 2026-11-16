@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TCG Price Checker - compares every sealed product in a Shopify shop with TCGplayer prices.
+"""TCG Price Checker - compares a Shopify shop's sealed product and TCG singles with TCGplayer prices.
 
 Easiest: use the app ("TCG Price Checker.exe" on Windows, "TCG Price Checker.app" on Mac). It needs nothing
 installed and can be moved anywhere; its saved choices, cache and reports live in the folder next to it.
@@ -13,12 +13,16 @@ The app appears next to this file. Copying a Mac app to another Mac: the first t
 Running the script directly instead also works: double-click on Windows, or python3 tcg_price_checker.py on a Mac.
 
 It opens showing the last check straight away, then checks again in the background. The first check of the
-day reads every Shopify product (about a minute); later ones only fetch what changed (a few seconds).
+day reads every Shopify product with one bulk operation; later ones only fetch what changed (a few seconds).
 
-  * Every sealed listing (product types Box / Pack / Tin by default; singles are never checked) is matched
-    automatically to a TCGplayer sealed product using tcgcsv.com, TCGplayer's prices republished once a day.
-  * Status: URGENT / DRIFTING = our price is that far from TCGplayer (percentages set in Settings),
-    CHECK MATCH = please confirm the TCGplayer product, plus cost, margin, presale and fast-moving flags.
+  * Every active Shopify listing is shown. Sealed product (types Box / Pack / Tin by default) is matched to a
+    TCGplayer sealed product; TCG singles (MTG / Pokemon / One Piece... by tag) to the TCGplayer card by set
+    code, name, number, treatment and finish, priced by condition. Everything TCGplayer can't price (sports
+    cards, graded slabs, accessories) is listed as NO PRICE SOURCE. Prices come from tcgcsv.com, TCGplayer's
+    prices republished once a day.
+  * Status: URGENT / DRIFTING = our price is that far from TCGplayer (percentages set in Settings; "Need
+    update" shows both, with the suggested new price), CHECK MATCH = please confirm the TCGplayer product,
+    plus cost, margin, presale and fast-moving flags, and stock per Shopify location.
   * Choices people make in the window (confirmed matches, hidden products, typed-in live prices, settings)
     are saved in products.json next to this file. cache/ and reports/ are created here too.
   * Shopify login comes from the shopify: section of a config.yaml (store_url + client_id/client_secret,
@@ -27,7 +31,7 @@ day reads every Shopify product (about a minute); later ones only fetch what cha
 
 Read-only: it only reads from Shopify and tcgcsv, and never changes anything in the shop.
 
-Command line (optional):  py tcg_price_checker.py --cli [--shopify-csv export.csv]
+Command line (optional):  py tcg_price_checker.py --cli [--shopify-csv export.csv] [--show-zero] [--timings]
 """
 import argparse
 import concurrent.futures as cf
@@ -92,8 +96,13 @@ PRESALE_WORDS = ("presale", "pre-sale", "preorder", "pre-order")
 SINGLE_CARD_FIELDS = {"Rarity", "Number"}
 POS_MARK = re.compile(r"\(\s*POS\s*\)", re.I)  # shopfront marker; can appear anywhere in a title
 TAG_ORDER = {"URGENT": 0, "DRIFTING": 1, "CHECK MATCH": 2, "OK": 3, "SELF-PRICED": 4, "NO PRICE": 5,
-             "NO MATCH": 6, "NO DATA": 7}
+             "NO MATCH": 6, "NO PRICE SOURCE": 7, "NO DATA": 8}
+NEED_UPDATE = ("URGENT", "DRIFTING")  # rows whose price should change
 INDEX_VERSION = 1
+SINGLES_VERSION = 1
+# card conditions as Shopify variants spell them -> our short codes (tcgcsv prices are Near Mint)
+CONDITIONS = {"NM": "Near Mint", "LP": "Lightly Played", "MP": "Moderately Played", "HP": "Heavily Played",
+              "DMG": "Damaged"}
 FIELD_NAMES = {"marketPrice": "TCGplayer Market Price", "lowPrice": "TCGplayer lowest listing"}
 RARE_WORD_WEIGHT = 5.5  # word weight (idf) above which a word names something specific
 
@@ -116,6 +125,23 @@ DEFAULT_SETTINGS = {
     "new_release_days": 30,
     # TCGplayer games to match against (tcgcsv category ids)
     "tcg_categories": [1, 2, 3, 85, 68, 79, 86, 90, 21, 66, 71, 89, 76, 91, 93, 62, 63, 80, 81],
+    # singles: price-check TCG single cards too (matched to TCGplayer cards by set code, name and number)
+    "check_singles": True,
+    # % of the Near Mint price a single in this condition should sell for
+    "condition_pct": {"NM": 100, "LP": 85, "MP": 70, "HP": 55, "DMG": 40},
+    # Shopify tag -> TCGplayer game (tcgcsv category id) for singles
+    "singles_tags": {"MTG Singles": 1, "Magic Singles": 1, "Pokemon Singles": 3, "Pokemon Japan Singles": 85,
+                     "One Piece Singles": 68, "Yu-Gi-Oh Singles": 2, "YuGiOh Singles": 2, "Lorcana Singles": 71,
+                     "Star Wars Unlimited Singles": 79, "Flesh and Blood Singles": 62, "Digimon Singles": 63,
+                     "Dragon Ball Singles": 80, "Union Arena Singles": 81, "Gundam Singles": 86,
+                     "Riftbound Singles": 89},
+    # singles with any of these tags (or title words) have no TCGplayer price: listed as NO PRICE SOURCE
+    "no_price_source_tags": ["Sports Singles", "baseball", "football", "basketball", "hockey", "soccer", "ufc",
+                             "wrestling", "racing", "golf", "Graded", "PSA", "BGS", "CGC"],
+    # out-of-stock (0 or blank) listings are hidden in the window and reports unless this is on
+    "show_zero_stock": False,
+    # read every Shopify product with one bulk operation (much faster than paging); off = page through
+    "shopify_bulk": True,
 }
 
 # Matches already checked by hand; used to start products.json the first time this runs somewhere new.
@@ -183,6 +209,11 @@ def to_float(value):
         return None
 
 
+def to_int(value):
+    f = to_float(value)
+    return None if f is None else int(f)
+
+
 def is_sealed(product):
     return not any(e.get("name") in SINGLE_CARD_FIELDS for e in product.get("extendedData") or [])
 
@@ -211,6 +242,8 @@ def load_config(path):
     if config is None:  # first run on this computer (or nothing usable to recover)
         config = {"overrides": json.loads(json.dumps(DEFAULT_OVERRIDES))}
     config["settings"] = {**DEFAULT_SETTINGS, **config.get("settings", {})}
+    for key in ("condition_pct",):  # tables: keep defaults for entries the file doesn't mention
+        config["settings"][key] = {**DEFAULT_SETTINGS[key], **(config["settings"].get(key) or {})}
     config["overrides"] = config.get("overrides", config.pop("products", []))
     return config
 
@@ -270,14 +303,76 @@ def release_date(group):
     return published[:10] if published[10:19] == "T00:00:00" else ""
 
 
-SAVED = object()  # marks a set whose prices come from the saved copy of today's snapshot
+FIELD_INDEX = {"marketPrice": 0, "lowPrice": 1}  # position in a cached price entry [market, low]
+FETCH_THREADS = 16  # parallel downloads from tcgcsv (it's a static file server)
+
+
+def card_key(text):
+    """A card or set name for lookups: lower case, accents and punctuation dropped."""
+    t = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode().lower()
+    t = re.sub(r"['’`.]", "", t.replace("&", " and "))
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", t).split())
+
+
+def code_key(code):
+    """Set code for lookups: 'PRB-01' / 'prb01' / 'OP 05' all compare equal."""
+    return re.sub(r"[^a-z0-9]", "", (code or "").lower())
+
+
+def number_key(text):
+    """Collector number for comparing: '202/165' -> '202', '008' -> '8', 'OP05-041' -> 'op05-041'."""
+    t = re.sub(r"[^a-z0-9-]", "", (text or "").split("/")[0].lower().lstrip("#")).strip("-")
+    return str(int(t)) if t.isdigit() else t
+
+
+def same_number(ours, theirs):
+    """Collector numbers agree: equal, or one is just the number part of the other ('118' vs 'OP11-118')."""
+    if not ours or not theirs or ours == theirs:
+        return True
+    tail = lambda n: (re.search(r"(\d+)[a-z]?$", n) or [None, None])[1]
+    return (ours.isdigit() or theirs.isdigit()) and tail(ours) is not None and \
+        int(tail(ours)) == int(tail(theirs) or -1)
+
+
+NUMBER_SEGMENT = re.compile(r"^#?(?:[A-Za-z]{1,4}\d*-?)?\d+[A-Za-z]?(?:/[A-Za-z]*\d+)?$")
+PAREN = re.compile(r"\(([^()]*)\)")
+
+
+def split_card_name(name):
+    """'Mewtwo EX (164 Secret Full Art)' -> ('mewtwo ex', '164', {'secret', 'full', 'art'});
+    'Zapdos ex - 202/165' -> ('zapdos ex', '202', set()). Works for TCGplayer names and our titles."""
+    number, treat = "", set()
+    for inner in PAREN.findall(name):
+        m = re.match(r"\s*#?(\d+[a-z]?)\b\s*(.*)$", inner, re.I)
+        if m:
+            number = number or number_key(m.group(1))
+            inner = m.group(2)
+        treat |= set(card_key(inner).split())
+    rest = PAREN.sub(" ", name)
+    parts = [p.strip() for p in rest.split(" - ")]
+    keep = []
+    for p in parts:
+        if NUMBER_SEGMENT.match(p) and keep:
+            number = number or number_key(p)
+        elif p:
+            keep.append(p)
+    return card_key(" - ".join(keep)), number, treat
 
 
 class TcgIndex:
-    """Every sealed TCGplayer product in the chosen games, cached on disk and refreshed when sets change."""
+    """Every TCGplayer product in the chosen games, cached on disk and refreshed when sets change.
+
+    Sealed products of every set are kept in tcg_index.json (for matching sealed listings). Single cards are
+    only downloaded for the sets we actually stock singles from, one small file per set in cache/cards/.
+    Prices are cached per set in cache/prices/ for the current daily snapshot, so a second check the same
+    day downloads nothing, and only sets whose file is missing or older are fetched.
+    """
 
     def __init__(self, cache_dir):
-        self.path = Path(cache_dir) / "tcg_index.json"
+        self.cache_dir = Path(cache_dir)
+        self.path = self.cache_dir / "tcg_index.json"
+        self.cards_dir = self.cache_dir / "cards"
+        self.prices_dir = self.cache_dir / "prices"
         self.data = {"version": INDEX_VERSION, "categories": {}, "groups": {}}
         if self.path.exists():
             try:
@@ -288,9 +383,11 @@ class TcgIndex:
                 pass
         self._prices = {}
         self._built = False
-        # last price seen per product and field: {"cat/group/id": {"marketPrice": [price, "2026-10-27"], ...}}
-        # plus which sets were downloaded for which snapshot, so a second check the same day needs no download
-        self.history_path = Path(cache_dir) / "last_prices.json"
+        self._cards = {}       # "cat/group" -> lookup tables for that set's single cards
+        self._codes = None     # (cat, set code) -> ["cat/group", ...]
+        self._stamp = ""       # fingerprint of the sealed catalogue (see sealed_stamp)
+        # last price seen per product (and per card finish): {"cat/group/id[/finish]": {"marketPrice": [price, date]}}
+        self.history_path = self.cache_dir / "last_prices.json"
         try:
             saved = json.loads(self.history_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -298,27 +395,61 @@ class TcgIndex:
         if "prices" not in saved:  # older file: just the prices
             saved = {"prices": saved}
         self.history = saved["prices"]
-        self.history_snapshot = saved.get("snapshot", "")
-        self.history_groups = set(saved.get("groups", []))
         self.snapshot = ""       # tcgcsv's last-updated time for the snapshot in use, set by PriceChecker.run
         self.snapshot_date = ""
 
     def category_list(self):
         return http_json(f"{TCGCSV}/categories")["results"]
 
+    @staticmethod
+    def _sealed_entry(cid, g, products):
+        sealed = []
+        for p in products:
+            if is_sealed(p):
+                pre = p.get("presaleInfo") or {}
+                sealed.append({"id": p["productId"], "name": p["name"], "url": p.get("url"),
+                               "presale": bool(pre.get("isPresale")),
+                               "release": (pre.get("releasedOn") or "")[:10]})
+        return {"category": cid, "group": g["groupId"], "name": g["name"], "abbr": g.get("abbreviation") or "",
+                "modifiedOn": g.get("modifiedOn"), "published": release_date(g), "products": sealed}
+
+    @staticmethod
+    def _card_rows(products):
+        """Single cards of a set, compact: [id, name, number, rarity]."""
+        rows = []
+        for p in products:
+            if is_sealed(p):
+                continue
+            ext = {e.get("name"): e.get("value") for e in p.get("extendedData") or []}
+            rows.append([p["productId"], p["name"], ext.get("Number") or "", ext.get("Rarity") or ""])
+        return rows
+
+    def _write_cards(self, key, modified, rows):
+        try:
+            self.cards_dir.mkdir(parents=True, exist_ok=True)
+            (self.cards_dir / f"{key.replace('/', '_')}.json").write_text(
+                json.dumps({"version": SINGLES_VERSION, "modifiedOn": modified, "cards": rows}), encoding="utf-8")
+        except OSError:
+            pass
+        self._cards.pop(key, None)
+
     def refresh(self, category_ids, progress=None):
         """Fetch new/changed sets. First run downloads everything (about a minute)."""
         cats = {c["categoryId"]: c for c in self.category_list()}
+        wanted = [cid for cid in category_ids if cid in cats]
+
+        def group_list(cid):
+            try:
+                return cid, http_json(f"{TCGCSV}/{cid}/groups")["results"]
+            except Exception:  # category with no groups yet (tcgcsv returns a 404 XML page)
+                return cid, []
+
         todo = []
-        for cid in category_ids:
-            if cid not in cats:
-                continue
+        with cf.ThreadPoolExecutor(FETCH_THREADS) as ex:
+            lists = list(ex.map(group_list, wanted))
+        for cid, groups in lists:
             self.data["categories"][str(cid)] = {"name": cats[cid]["name"],
                                                  "display": cats[cid].get("displayName") or ""}
-            try:
-                groups = http_json(f"{TCGCSV}/{cid}/groups")["results"]
-            except Exception:  # category with no groups yet (tcgcsv returns a 404 XML page)
-                groups = []
             for g in groups:
                 key = f"{cid}/{g['groupId']}"
                 cached = self.data["groups"].get(key)
@@ -326,34 +457,34 @@ class TcgIndex:
                     todo.append((cid, g))
                 else:
                     cached["published"] = release_date(g)
+                    cached["abbr"] = g.get("abbreviation") or ""
 
         def fetch(job):
             cid, g = job
             try:
                 products = http_json(f"{TCGCSV}/{cid}/{g['groupId']}/products")["results"]
-            except Exception:
+            except Exception:  # (as before: a set tcgcsv can't serve is kept with no products)
                 products = []
-            sealed = []
-            for p in products:
-                if is_sealed(p):
-                    pre = p.get("presaleInfo") or {}
-                    sealed.append({"id": p["productId"], "name": p["name"], "url": p.get("url"),
-                                   "presale": bool(pre.get("isPresale")),
-                                   "release": (pre.get("releasedOn") or "")[:10]})
-            return f"{cid}/{g['groupId']}", {"category": cid, "group": g["groupId"], "name": g["name"],
-                                             "abbr": g.get("abbreviation") or "",
-                                             "modifiedOn": g.get("modifiedOn"),
-                                             "published": release_date(g), "products": sealed}
+            return job, products
 
-        with cf.ThreadPoolExecutor(8) as ex:
-            for i, (key, value) in enumerate(ex.map(fetch, todo), 1):
-                self.data["groups"][key] = value
+        changed = 0
+        with cf.ThreadPoolExecutor(FETCH_THREADS) as ex:
+            for i, ((cid, g), products) in enumerate(ex.map(fetch, todo), 1):
+                key = f"{cid}/{g['groupId']}"
+                self.data["groups"][key] = self._sealed_entry(cid, g, products)
+                changed += 1
+                # we already have this set's cards: keep them current from the same download
+                if products and (self.cards_dir / f"{key.replace('/', '_')}.json").exists():
+                    self._write_cards(key, g.get("modifiedOn"), self._card_rows(products))
                 if progress and (i % 25 == 0 or i == len(todo)):
                     progress(f"Updating TCGplayer catalogue: {i} of {len(todo)} sets")
         # always save: release dates may have changed even when no set needed downloading
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data), encoding="utf-8")
         self._built = False
+        self._codes = None
+        self._stamp = ""
+        return changed
 
     def _build(self):
         """Word lists + inverted index for matching."""
@@ -385,6 +516,20 @@ class TcgIndex:
         self.idf = {w: math.log(n / c) + 1 for w, c in df.items()}
         self._built = True
 
+    def sealed_stamp(self):
+        """Fingerprint of the sealed catalogue: saved automatic matches stay valid while it's unchanged."""
+        if self._stamp:
+            return self._stamp
+        import hashlib
+        h = hashlib.sha1()
+        for key in sorted(self.data["groups"]):
+            g = self.data["groups"][key]
+            h.update(f"{key}|{g['name']}|{g['abbr']}|{g.get('published', '')}|".encode())
+            for p in g["products"]:
+                h.update(f"{p['id']}:{p['name']}:{p.get('presale')}:{p.get('release')};".encode())
+        self._stamp = h.hexdigest()
+        return self._stamp
+
     def weight(self, w):
         return self.idf.get(w, 1.0)  # words TCGplayer never uses are probably our own noise
 
@@ -414,21 +559,138 @@ class TcgIndex:
         g = self.data["groups"].get(f"{category}/{group}")
         if not g:
             return None
-        return next(({**p, "category": category, "group": group, "set": g["name"], "set_released": g.get("published", "")}
-                     for p in g["products"] if p["id"] == product_id), None)
+        found = next(({**p, "category": category, "group": group, "set": g["name"],
+                       "set_released": g.get("published", "")} for p in g["products"] if p["id"] == product_id), None)
+        if found is None:  # a single card
+            card = self.cards(f"{category}/{group}", download=False)["by_id"].get(product_id)
+            if card:
+                found = self.card_ref(card)
+        return found
 
-    def load_prices(self, keys, progress=None):
-        """Fetch price files for the given (category, group) pairs, in parallel.
-        Sets already downloaded for today's snapshot are read from the saved prices instead."""
-        same_snapshot = self.snapshot and self.snapshot == self.history_snapshot
+    # ---------------------------------------------------------------- single cards
+    def groups_for_code(self, category, code):
+        """Sets in a game with this set code (TCGplayer's abbreviation), e.g. (1, 'DSK')."""
+        if self._codes is None:
+            self._codes, self._set_names = {}, {}
+            for key, g in self.data["groups"].items():
+                if g.get("abbr"):
+                    self._codes.setdefault((g["category"], code_key(g["abbr"])), []).append(key)
+                self._set_names.setdefault((g["category"], card_key(g["name"])), []).append(key)
+        return self._codes.get((category, code_key(code)), [])
+
+    def groups_for_set_name(self, category, name):
+        self.groups_for_code(category, "")
+        return self._set_names.get((category, card_key(name)), [])
+
+    def ensure_cards(self, keys, progress=None):
+        """Make sure the single-card lists of these sets are on disk and current (download the rest)."""
+        todo = []
+        for key in set(keys):
+            g = self.data["groups"].get(key)
+            if not g or key in self._cards:
+                continue
+            path = self.cards_dir / f"{key.replace('/', '_')}.json"
+            try:
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                if saved.get("version") == SINGLES_VERSION and saved.get("modifiedOn") == g.get("modifiedOn"):
+                    self._cards[key] = self._card_tables(key, saved["cards"])
+                    continue
+            except (OSError, ValueError):
+                pass
+            todo.append(key)
+
+        def fetch(key):
+            cid, gid = key.split("/")
+            try:
+                return key, http_json(f"{TCGCSV}/{cid}/{gid}/products")["results"]
+            except Exception:
+                return key, None
+
+        with cf.ThreadPoolExecutor(FETCH_THREADS) as ex:
+            for i, (key, products) in enumerate(ex.map(fetch, todo), 1):
+                if products is not None:
+                    rows = self._card_rows(products)
+                    self._write_cards(key, self.data["groups"][key].get("modifiedOn"), rows)
+                    self._cards[key] = self._card_tables(key, rows)
+                if progress and (i % 25 == 0 or i == len(todo)):
+                    progress(f"Downloading TCGplayer card lists: {i} of {len(todo)} sets")
+        return len(todo)
+
+    def _card_tables(self, key, rows):
+        g = self.data["groups"].get(key, {})
+        exact, base, by_id = {}, {}, {}
+        for pid, name, number, rarity in rows:
+            b, num, treat = split_card_name(name)
+            card = {"id": pid, "name": name, "number": number, "rarity": rarity, "num": number_key(number) or num,
+                    "treat": treat, "base": b, "category": g.get("category"), "group": g.get("group"),
+                    "set": g.get("name", ""), "set_released": g.get("published", "")}
+            exact.setdefault(card_key(name), []).append(card)
+            base.setdefault(b, []).append(card)
+            by_id[pid] = card
+        return {"exact": exact, "base": base, "by_id": by_id}
+
+    def cards(self, key, download=True):
+        if key not in self._cards:
+            if download:
+                self.ensure_cards([key])
+            else:  # only what's on disk
+                path = self.cards_dir / f"{key.replace('/', '_')}.json"
+                try:
+                    self._cards[key] = self._card_tables(key, json.loads(path.read_text(encoding="utf-8"))["cards"])
+                except (OSError, ValueError, KeyError):
+                    return {"exact": {}, "base": {}, "by_id": {}}
+        return self._cards.get(key) or {"exact": {}, "base": {}, "by_id": {}}
+
+    def card_ref(self, card):
+        cat = self.data["categories"].get(str(card["category"]), {})
+        return {"id": card["id"], "name": card["name"], "category": card["category"], "group": card["group"],
+                "game": cat.get("display") or cat.get("name", ""),
+                "set": card["set"], "set_released": card.get("set_released", ""), "number": card["number"],
+                "url": f"https://www.tcgplayer.com/product/{card['id']}", "single": True}
+
+    def search_cards(self, text, categories=None, limit=40):
+        """Single cards (in the sets downloaded so far) whose name fits the text, best first."""
+        q = set(card_key(SHOPIFY_NOISE.sub(" ", text)).split())
+        if not q:
+            return []
+        if not self._cards and self.cards_dir.is_dir():  # (window opened on the last results: read from disk)
+            for path in self.cards_dir.glob("*_*.json"):
+                self.cards(path.stem.replace("_", "/"), download=False)
+        scored = []
+        for key, tables in self._cards.items():
+            if categories and int(key.split("/")[0]) not in categories:
+                continue
+            set_words = set(card_key(self.data["groups"].get(key, {}).get("name", "")).split())
+            set_words.add(code_key(self.data["groups"].get(key, {}).get("abbr", "")))
+            for card in tables["by_id"].values():
+                cw = set(card_key(card["name"]).split()) | {card["num"]}
+                hit = q & cw
+                if not hit:
+                    continue
+                score = len(hit) / len(q | cw) + 0.5 * len(q & set_words) / len(q)
+                scored.append((min(score, 1.0), self.card_ref(card)))
+        scored.sort(key=lambda sp: sp[0], reverse=True)
+        return scored[:limit]
+
+    # ---------------------------------------------------------------- prices
+    def load_prices(self, keys, progress=None, remember=()):
+        """Prices for the given (category, group) pairs. Sets already downloaded for today's snapshot come
+        from cache/prices/; the rest are fetched in parallel. remember: (cat, group, id, finish) of single
+        cards whose last-seen price should be kept."""
         todo = []
         for k in set(keys):
             if k in self._prices:
                 continue
-            if same_snapshot and f"{k[0]}/{k[1]}" in self.history_groups:
-                self._prices[k] = SAVED
-            else:
-                todo.append(k)
+            path = self.prices_dir / f"{k[0]}_{k[1]}.json"
+            if self.snapshot:
+                try:
+                    saved = json.loads(path.read_text(encoding="utf-8"))
+                    if saved.get("snapshot") == self.snapshot:
+                        self._prices[k] = saved["prices"]
+                        continue
+                except (OSError, ValueError, KeyError):
+                    pass
+            todo.append(k)
 
         def fetch(key):
             try:
@@ -437,65 +699,88 @@ class TcgIndex:
                 return key, None
             by_id = {}
             for r in rows:
-                by_id.setdefault(r["productId"], []).append(r)
+                by_id.setdefault(str(r["productId"]), {})[r.get("subTypeName") or "Normal"] = [
+                    r.get("marketPrice"), r.get("lowPrice")]
             return key, by_id
 
-        failed = []
-        with cf.ThreadPoolExecutor(8) as ex:
+        failed, fetched = [], []
+        with cf.ThreadPoolExecutor(FETCH_THREADS) as ex:
             for i, (key, value) in enumerate(ex.map(fetch, todo), 1):
                 if value is None:
                     failed.append(key)
-                else:
-                    self._prices[key] = value
+                    continue
+                self._prices[key] = value
+                fetched.append(key)
+                if self.snapshot:
+                    try:
+                        self.prices_dir.mkdir(parents=True, exist_ok=True)
+                        (self.prices_dir / f"{key[0]}_{key[1]}.json").write_text(
+                            json.dumps({"snapshot": self.snapshot, "prices": value}), encoding="utf-8")
+                    except OSError:
+                        pass
                 if progress and (i % 25 == 0 or i == len(todo)):
                     progress(f"Loading TCGplayer prices: {i} of {len(todo)} sets")
         if todo and len(failed) > len(todo) // 2:
             raise ConnectionError("Couldn't download TCGplayer prices from tcgcsv.com")
         if self.snapshot_date:
-            self._remember([k for k in todo if k not in failed])
+            self._remember(fetched, remember)
 
     @staticmethod
-    def _row(rows):
-        # sealed product is "Normal"; fall back to whatever subtype exists
-        return next((r for r in rows if r.get("subTypeName") == "Normal"), rows[0] if rows else {})
+    def _row(rows, finish=None):
+        """[market, low] for a finish; sealed product is "Normal" (fall back to whatever subtype exists)."""
+        if not rows:
+            return None
+        if finish:
+            return rows.get(finish)
+        return rows.get("Normal") or next(iter(rows.values()))
 
-    def _remember(self, keys):
-        if self.snapshot != self.history_snapshot:  # a new snapshot: its sets haven't been downloaded yet
-            self.history_snapshot, self.history_groups = self.snapshot, set()
-        for key in keys:
-            self.history_groups.add(f"{key[0]}/{key[1]}")
-            for product_id, rows in self._prices.get(key, {}).items():
-                row = self._row(rows)
-                entry = self.history.setdefault(f"{key[0]}/{key[1]}/{product_id}", {})
-                for f in ("marketPrice", "lowPrice"):
-                    if row.get(f) is not None:
-                        entry[f] = [row[f], self.snapshot_date]
-        if not keys:
+    def finishes(self, category, group, product_id):
+        """TCGplayer subtypes (Normal, Foil, Holofoil, ...) that have a price row for this product today."""
+        return list((self._prices.get((category, group)) or {}).get(str(product_id), {}))
+
+    def _remember(self, keys, cards=()):
+        changed = False
+        for key in keys:  # sealed products: as before, every one in the set
+            g = self.data["groups"].get(f"{key[0]}/{key[1]}", {})
+            prices = self._prices.get(key, {})
+            for p in g.get("products", []):
+                row = self._row(prices.get(str(p["id"])))
+                if row:
+                    entry = self.history.setdefault(f"{key[0]}/{key[1]}/{p['id']}", {})
+                    for f, i in FIELD_INDEX.items():
+                        if row[i] is not None:
+                            entry[f] = [row[i], self.snapshot_date]
+                            changed = True
+        for c, g, pid, finish in cards:  # single cards: only the ones we stock, per finish
+            row = self._row((self._prices.get((c, g)) or {}).get(str(pid)), finish)
+            if row:
+                entry = self.history.setdefault(f"{c}/{g}/{pid}/{finish}", {})
+                for f, i in FIELD_INDEX.items():
+                    if row[i] is not None and entry.get(f) != [row[i], self.snapshot_date]:
+                        entry[f] = [row[i], self.snapshot_date]
+                        changed = True
+        if not changed:
             return
         try:
             self.history_path.parent.mkdir(parents=True, exist_ok=True)
-            self.history_path.write_text(json.dumps({"snapshot": self.history_snapshot, "groups": sorted(self.history_groups),
-                                                     "prices": self.history}), encoding="utf-8")
+            self.history_path.write_text(json.dumps({"snapshot": self.snapshot, "prices": self.history}),
+                                         encoding="utf-8")
         except OSError:
             pass
 
-    def price(self, category, group, product_id, field):
+    def price(self, category, group, product_id, field, finish=None):
         """Returns (price, as_of, cheapest listing). Only the chosen field is used (Market Price by default).
+        finish: the TCGplayer subtype for single cards (None for sealed product).
 
         as_of is "" for today's snapshot, or the date of the last snapshot that had a price: tcgcsv leaves
         out products with no listings, but TCGplayer still shows their last Market Price.
         """
-        seen = self.history.get(f"{category}/{group}/{product_id}", {})
-        if self._prices.get((category, group)) is SAVED:  # downloaded earlier for this same snapshot
-            today = lambda f: seen[f][0] if f in seen and seen[f][1] == self.snapshot_date else None
-            if today(field) is not None:
-                return today(field), "", today("lowPrice")
-            low = today("lowPrice")
-        else:
-            row = self._row(self._prices.get((category, group), {}).get(product_id, []))
-            if row.get(field) is not None:
-                return row[field], "", row.get("lowPrice")
-            low = row.get("lowPrice")
+        seen = self.history.get(f"{category}/{group}/{product_id}" + (f"/{finish}" if finish else ""), {})
+        row = self._row((self._prices.get((category, group)) or {}).get(str(product_id)), finish)
+        i = FIELD_INDEX.get(field, 0)
+        if row and row[i] is not None:
+            return row[i], "", row[1]
+        low = row[1] if row else None
         if seen.get(field):
             return seen[field][0], seen[field][1], low
         return None, "", low
@@ -633,62 +918,212 @@ def shopify_credentials(config_path):
     return None
 
 
-def shopify_from_api(store, token, progress=None, changed_since=None):
-    """Yield one record per variant of every product in our shop (or only products changed since a time)."""
-    url = f"https://{store}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
-    query = """
-    query($cursor: String, $size: Int!, $q: String) {
-      products(first: $size, after: $cursor, query: $q) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          id title status tags productType
-          variants(first: 50) { nodes { title price compareAtPrice sku inventoryQuantity COST } }
-        }
-      }
-    }"""
-    cost_field = "inventoryItem { unitCost { amount } }"  # "Cost per item"; needs the read_inventory scope
-    cursor, count, size, tries = None, 0, 100, 0
-    while True:
-        q = f"updated_at:>'{changed_since}'" if changed_since else None
-        body = json.dumps({"query": query.replace("COST", cost_field),
-                           "variables": {"cursor": cursor, "size": size, "q": q}}).encode()
-        data = http_json(url, data=body, headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"})
-        if data.get("errors"):
-            text = json.dumps(data["errors"])
-            tries += 1
-            if tries > 8:
-                raise SetupError(f"Shopify API error: {data['errors']}")
-            if "THROTTLED" in text:
+class ShopifyReader:
+    """Read-only access to the shop's products through the Admin GraphQL API.
+
+    Only queries are sent. A full read uses one bulk operation (bulkOperationRunQuery: Shopify builds a
+    file of every variant, which is then downloaded), far faster than paging for a big catalogue. Reads
+    of what changed since the last check page through productVariants instead. Bulk operations are never
+    cancelled: if Shopify won't start one, paging is used.
+
+    Stock per location needs the read_inventory and read_locations permissions, cost per item needs
+    read_inventory. Without them the read carries on with those left blank, and self.notes says so.
+    """
+
+    COST = "unitCost { amount }"
+    LEVEL = 'location { name } quantities(names: ["available"]) { quantity }'
+    PAGE_LEVELS = "inventoryLevels(first: 20) { nodes { " + LEVEL + " } }"
+    BULK_LEVELS = "inventoryLevels { edges { node { " + LEVEL + " } } }"
+    PRODUCT = "product { id title status tags productType }"
+
+    def __init__(self, store, token, progress=None, use_bulk=True):
+        self.url = f"https://{store}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+        self.token = token
+        self.progress = progress or (lambda msg: None)
+        self.use_bulk = use_bulk
+        self.cost = True        # can read "Cost per item"
+        self.levels = True      # can read stock per location
+        self.notes = []
+        self.how = ""           # "bulk" / "paging", for timings
+
+    # ---------------------------------------------------------------- plumbing
+    def gql(self, query, variables=None):
+        """Run one GraphQL query; retries when throttled. Returns (data, errors)."""
+        body = json.dumps({"query": query, "variables": variables or {}}).encode()
+        for attempt in range(8):
+            data = http_json(self.url, data=body, headers={"X-Shopify-Access-Token": self.token,
+                                                           "Content-Type": "application/json"})
+            errors = data.get("errors")
+            if errors and "THROTTLED" in json.dumps(errors):
                 time.sleep(2)
-            elif "MAX_COST_EXCEEDED" in text and size > 10:
-                size //= 2
-            elif cost_field and ("ACCESS_DENIED" in text or "inventoryItem" in text):
-                cost_field = ""  # app can't see costs: carry on without them
-            else:
-                raise SetupError(f"Shopify API error: {data['errors']}")
-            continue
-        tries = 0
-        page = data["data"]["products"]
-        for p in page["nodes"]:
-            for v in p["variants"]["nodes"]:
-                yield {
-                    "product_id": p.get("id"),
-                    "title": p["title"],
-                    "variant": "" if v["title"] == "Default Title" else v["title"],
-                    "price": to_float(v["price"]),
-                    "compare_at": to_float(v.get("compareAtPrice")),
-                    "cost": to_float(((v.get("inventoryItem") or {}).get("unitCost") or {}).get("amount")),
-                    "stock": v.get("inventoryQuantity"),
-                    "status": p.get("status", ""),
-                    "type": p.get("productType") or "",
-                    "tags": ", ".join(p.get("tags") or []),
-                }
-        count += len(page["nodes"])
-        if progress:
-            progress(f"Reading Shopify products: {count}")
-        if not page["pageInfo"]["hasNextPage"]:
+                continue
+            return data.get("data"), errors
+        raise SetupError(f"Shopify API error: {errors}")
+
+    def _denied(self, errors):
+        """Drop a field Shopify won't let us read; True if there was one to drop."""
+        text = json.dumps(errors).lower()
+        if not any(w in text for w in ("access_denied", "access denied", "read_inventory", "read_locations")):
+            return False
+        if self.levels:
+            self.levels = False
+            self.notes.append("Shopify didn't allow reading stock per location (the app needs the read_inventory "
+                              "and read_locations permissions): showing total stock only")
+            return True
+        if self.cost:
+            self.cost = False
+            self.notes.append("Shopify didn't allow reading cost per item (needs read_inventory): costs left blank")
+            return True
+        return False
+
+    def _variant_fields(self, bulk):
+        inner = " ".join(f for f, on in ((self.COST, self.cost),
+                                         (self.BULK_LEVELS if bulk else self.PAGE_LEVELS, self.levels)) if on)
+        item = f"inventoryItem {{ {inner} }}" if inner else ""
+        return f"id title price compareAtPrice sku inventoryQuantity {self.PRODUCT} {item}"
+
+    def _record(self, v, levels):
+        p = v.get("product") or {}
+        cost = ((v.get("inventoryItem") or {}).get("unitCost") or {}).get("amount")
+        stock_at = None
+        if self.levels and levels is not None:
+            stock_at = {}
+            for lv in levels:
+                name = (lv.get("location") or {}).get("name") or "?"
+                qty = sum(q.get("quantity") or 0 for q in lv.get("quantities") or [])
+                stock_at[name] = stock_at.get(name, 0) + qty
+        return {
+            "product_id": p.get("id"),
+            "variant_id": v.get("id"),
+            "title": p.get("title") or "",
+            "variant": "" if v.get("title") == "Default Title" else (v.get("title") or ""),
+            "price": to_float(v.get("price")),
+            "compare_at": to_float(v.get("compareAtPrice")),
+            "cost": to_float(cost),
+            "stock": v.get("inventoryQuantity"),
+            "locations": stock_at,
+            "status": p.get("status", ""),
+            "type": p.get("productType") or "",
+            "tags": ", ".join(p.get("tags") or []),
+        }
+
+    # ---------------------------------------------------------------- full / changed reads
+    def variants(self, changed_since=None):
+        """Every variant (or only those changed since a time). Tries a bulk operation first."""
+        q = f"updated_at:>'{changed_since}'" if changed_since else None
+        if self.use_bulk:
+            if q:  # a few changes: paging is quicker than starting a bulk operation
+                items = self._paged(q, give_up_after=2000)
+                if items is not None:
+                    return items
+            items = self._bulk(q)
+            if items is not None:
+                return items
+        return self._paged(q)
+
+    def _paged(self, q, give_up_after=None):
+        """Page through the variants. None if there are more than give_up_after (a bulk read is quicker)."""
+        self.how = "paging"
+        out, cursor, size = [], None, 80
+        while True:
+            query = ("query($cursor: String, $size: Int!, $q: String) { productVariants(first: $size, after: $cursor, "
+                     "query: $q) { pageInfo { hasNextPage endCursor } nodes { "
+                     + self._variant_fields(bulk=False) + " } } }")
+            data, errors = self.gql(query, {"cursor": cursor, "size": size, "q": q})
+            if errors:
+                if "MAX_COST_EXCEEDED" in json.dumps(errors) and size > 10:
+                    size //= 2
+                    continue
+                if self._denied(errors):
+                    continue
+                raise SetupError(f"Shopify API error: {errors}")
+            page = data["productVariants"]
+            for v in page["nodes"]:
+                levels = ((v.get("inventoryItem") or {}).get("inventoryLevels") or {}).get("nodes")
+                out.append(self._record(v, levels))
+            self.progress(f"Reading Shopify products: {len(out)} variants")
+            if not page["pageInfo"]["hasNextPage"]:
+                return out
+            if give_up_after and len(out) >= give_up_after:
+                return None
+            cursor = page["pageInfo"]["endCursor"]
+
+    def _bulk(self, q):
+        """One bulk operation for every variant. None when Shopify won't run one (then we page instead)."""
+        self.how = "bulk"
+        while True:
+            root = f'productVariants(query: {json.dumps(q)})' if q else "productVariants"
+            inner = "{ " + root + " { edges { node { " + self._variant_fields(bulk=True) + " } } } }"
+            data, errors = self.gql("mutation($q: String!) { bulkOperationRunQuery(query: $q) { "
+                                    "bulkOperation { id status } userErrors { field message } } }", {"q": inner})
+            if errors:
+                if self._denied(errors):
+                    continue
+                return None
+            result = data["bulkOperationRunQuery"]
+            if result.get("userErrors"):
+                text = json.dumps(result["userErrors"])
+                if self._denied(result["userErrors"]):
+                    continue
+                return None  # e.g. another bulk operation already running: page through instead
+            op = result["bulkOperation"]
             break
-        cursor = page["pageInfo"]["endCursor"]
+        started, wait = time.time(), 0.5
+        while True:
+            time.sleep(wait)
+            wait = min(wait * 1.5, 3)
+            data, errors = self.gql("query($id: ID!) { node(id: $id) { ... on BulkOperation { id status errorCode "
+                                    "objectCount url partialDataUrl } } }", {"id": op["id"]})
+            node = (data or {}).get("node") or {}
+            status = node.get("status")
+            self.progress(f"Shopify is preparing the product list: {node.get('objectCount') or 0} rows")
+            if status == "COMPLETED":
+                break
+            if status in ("FAILED", "CANCELED", "CANCELING", "EXPIRED"):
+                if node.get("errorCode") == "ACCESS_DENIED" and self._denied([{"extensions": {"code": "ACCESS_DENIED"}}]):
+                    return self._bulk(q)
+                return None
+            if time.time() - started > 900:
+                return None  # leave it running (never cancel); page instead
+        if not node.get("url"):
+            return []  # nothing matched
+        self.progress("Downloading the Shopify product list…")
+        req = urllib.request.Request(node["url"], headers={"User-Agent": USER_AGENT})
+        variants, levels = [], {}
+        with http_open(req, timeout=600) as resp:
+            for line in resp:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                parent = obj.get("__parentId")
+                if parent:
+                    levels.setdefault(parent, []).append(obj)
+                else:
+                    variants.append(obj)
+        return [self._record(v, levels.get(v["id"], []) if self.levels else None) for v in variants]
+
+    def changed_products(self, changed_since):
+        """Products whose title / status / tags / type changed: {product id: fields}."""
+        out, cursor = {}, None
+        while True:
+            data, errors = self.gql(
+                "query($cursor: String, $q: String) { products(first: 250, after: $cursor, query: $q) { "
+                "pageInfo { hasNextPage endCursor } nodes { id title status tags productType } } }",
+                {"cursor": cursor, "q": f"updated_at:>'{changed_since}'"})
+            if errors:
+                raise SetupError(f"Shopify API error: {errors}")
+            page = data["products"]
+            for p in page["nodes"]:
+                out[p["id"]] = {"title": p["title"], "status": p.get("status", ""), "type": p.get("productType") or "",
+                                "tags": ", ".join(p.get("tags") or [])}
+            if not page["pageInfo"]["hasNextPage"]:
+                return out
+            cursor = page["pageInfo"]["endCursor"]
+
+
+def shopify_from_api(store, token, progress=None, changed_since=None):
+    """Every variant of every product in our shop (or only those changed since a time)."""
+    return ShopifyReader(store, token, progress).variants(changed_since)
 
 
 def shopify_from_csv(path):
@@ -712,27 +1147,208 @@ def shopify_from_csv(path):
                 "price": price,
                 "compare_at": to_float(row.get("variant compare at price") or row.get("compare at price")),
                 "cost": to_float(row.get("cost per item")),
-                "stock": row.get("variant inventory qty") or None,
+                "stock": to_int(row.get("variant inventory qty")),
+                "locations": None,
                 "status": (parent.get("status") or "active").upper(),
                 "type": parent.get("type") or parent.get("product type") or "",
                 "tags": parent.get("tags", ""),
             }
 
 
+def status_ok(item, settings):
+    """Active (or draft, when drafts are wanted). Archived products are never listed."""
+    allowed = ("ACTIVE", "", "DRAFT") if settings.get("include_drafts") else ("ACTIVE", "")
+    return item.get("status", "").upper() in allowed
+
+
 def is_tracked(item, settings):
     """Sealed product we sell: right product type, active (unless drafts wanted), not on the ignore list."""
     if item.get("type", "").lower() not in {t.lower() for t in settings["sealed_types"]}:
         return False
-    allowed = ("ACTIVE", "", "DRAFT") if settings.get("include_drafts") else ("ACTIVE", "")
-    if item.get("status", "").upper() not in allowed:
+    if not status_ok(item, settings):
         return False
     return not has_any_word(item["title"], settings.get("ignore_words", []))
 
 
+_WORD_RES = {}
+
+
 def has_any_word(text, phrases):
     """Whole-word match, so "leaf" skips Leaf sports cards but not Leafeon."""
-    return any(re.search(rf"(?<![a-z0-9]){re.escape(p.strip().lower())}(?![a-z0-9])", (text or "").lower())
-               for p in phrases if p.strip())
+    key = tuple(p.strip().lower() for p in phrases if p.strip())
+    if not key:
+        return False
+    rx = _WORD_RES.get(key)
+    if rx is None:  # one compiled pattern per word list: this runs for every listing
+        rx = _WORD_RES[key] = re.compile("|".join(rf"(?<![a-z0-9]){re.escape(p)}(?![a-z0-9])" for p in key))
+    return bool(rx.search((text or "").lower()))
+
+
+def tag_list(item):
+    return [t.strip().lower() for t in (item.get("tags") or "").split(",") if t.strip()]
+
+
+def item_kind(item, settings):
+    """('sealed', None), ('single', tcgcsv category id or None) or ('other', None).
+
+    other = something TCGplayer can't price for us (sports cards, graded slabs, accessories, merch...):
+    it's listed with status NO PRICE SOURCE and never matched.
+    """
+    title, ptype = item.get("title") or "", (item.get("type") or "").lower()
+    if has_any_word(title, settings.get("ignore_words", [])):
+        return "other", None
+    if ptype in {t.lower() for t in settings["sealed_types"]}:
+        return "sealed", None
+    if not settings.get("check_singles", True) or "graded" in ptype or "slab" in ptype:
+        return "other", None
+    tags = tag_list(item)
+    blocked = {t.lower() for t in settings.get("no_price_source_tags", [])}
+    if blocked & set(tags):
+        return "other", None
+    games = {k.lower(): v for k, v in (settings.get("singles_tags") or {}).items()}
+    game = next((games[t] for t in tags if t in games), None)
+    if game is not None:
+        return "single", game
+    if ptype == "singles" and PAREN.search(title):  # a TCG single without a game tag: try every game
+        return "single", None
+    return "other", None
+
+
+LANGUAGES = ("japanese", "korean", "chinese", "german", "french", "italian", "spanish", "portuguese", "russian")
+
+
+def single_details(item):
+    """Condition, finish wanted, edition and language from a single's variant (and title)."""
+    v = re.sub(r"\s+", " ", (item.get("variant") or "").lower())
+    t = (item.get("title") or "").lower()
+    cond = "NM"
+    for code, pattern in (("DMG", r"\bdamaged\b|\bdmg\b"), ("HP", r"\bheavily\b|\bhp\b"),
+                          ("MP", r"\bmoderately\b|\bmp\b"), ("LP", r"\blightly\b|\blp\b"),
+                          ("NM", r"\bnear[ -]?mint\b|\bnm\b")):
+        if re.search(pattern, v):
+            cond = code
+            break
+    both = f"{v} {t}"
+    if re.search(r"\bnon[- ]?foil\b", v):
+        finish = "normal"
+    elif "reverse" in v or re.search(r"\)\s*-?\s*reverse\b|\breverse holo", t):
+        finish = "reverse"
+    elif re.search(r"\b(foil|holo|holofoil)\b", v) or re.search(r"\b(holofoil|holo)\s*$", t):
+        finish = "foil"
+    elif re.search(r"\bnormal\b", v):
+        finish = "normal"
+    else:
+        finish = None
+    edition = "1st" if re.search(r"\b1st\b|first edition", both) else ("unlimited" if "unlimited" in both else None)
+    language = next((lang for lang in LANGUAGES if re.search(rf"\b{lang}\b", both)), "english")
+    return {"condition": cond, "finish": finish, "edition": edition, "language": language}
+
+
+def resolve_finish(available, wanted, edition):
+    """Pick the TCGplayer subtype (Normal / Foil / Holofoil / Reverse Holofoil / 1st Edition ...) for a single.
+    Returns (subtype, sure)."""
+    if not available:
+        return None, False
+    opts, sure = list(available), True
+    first = [a for a in opts if a.startswith("1st Edition")]
+    unlimited = [a for a in opts if a.startswith("Unlimited")]
+    if first or unlimited:
+        if edition == "1st" and first:
+            opts = first
+        elif edition == "unlimited" and unlimited:
+            opts = unlimited
+        elif first and unlimited:  # not said which edition: Unlimited is the usual one, but please check
+            opts, sure = unlimited, False
+        else:
+            opts = first or unlimited
+    foil = lambda a: "foil" in a.lower() or "holo" in a.lower()
+    if wanted == "reverse":
+        pick = [a for a in opts if "reverse" in a.lower()]
+    elif wanted == "foil":
+        pick = [a for a in opts if foil(a) and "reverse" not in a.lower()] or \
+               [a for a in opts if "reverse" in a.lower()]
+        if any("reverse" in a.lower() for a in opts) and any(foil(a) and "reverse" not in a.lower() for a in opts):
+            sure = False  # "Foil" could be the holo or the reverse holo
+    elif wanted == "normal":
+        pick = [a for a in opts if not foil(a)]
+    else:  # nothing said: the plain printing, else the only (non-reverse) one
+        pick = ([a for a in opts if not foil(a)] or [a for a in opts if "reverse" not in a.lower()] or opts)
+    if not pick:
+        return opts[0], False
+    return pick[0], sure
+
+
+def match_single(index, item, game, settings):
+    """Match a TCG single to a TCGplayer card: set code -> set, then card name, number and treatment.
+    Returns (card or None, how, score) with how 'auto', 'check' or 'none'."""
+    title = re.sub(r"\s+", " ", POS_MARK.sub(" ", item["title"])).strip()
+    title = re.sub(r"\)-\s", ") - ", title)  # "Wrenn and Six (Borderless)- Double Masters 2022"
+    every = list(settings.get("tcg_categories", []))
+    if game is None:
+        return _match_single(index, title, every)
+    found = _match_single(index, title, [game])
+    if found[0] is None:  # e.g. a Japanese Pokemon set tagged "Pokemon Singles": look in the other games
+        other = _match_single(index, title, [c for c in every if c != game])
+        if other[0] is not None:
+            return other[0], "check", other[2]
+    return found
+
+
+def _match_single(index, title, cats):
+    keys, before = [], title
+    for m in reversed(list(PAREN.finditer(title))):  # the set code: the last (...) that is one
+        for c in cats:
+            keys = index.groups_for_code(c, m.group(1))
+            if keys:
+                break
+        if keys:
+            before = title[:m.start()].rstrip(" -")
+            break
+    segs = [s.strip() for s in before.split(" - ") if s.strip()]
+    if not keys:  # no known code: the set name as the last part(s) of the title (without a trailing code)
+        bare = re.sub(r"\s*\([^()]{1,12}\)\s*$", "", title)
+        segs = [s.strip() for s in bare.split(" - ") if s.strip()]
+        for k in range(len(segs) - 1, 0, -1):
+            for c in cats:
+                keys = index.groups_for_set_name(c, " - ".join(segs[k:]))
+                if keys:
+                    break
+            if keys:
+                segs = segs[:k]
+                break
+    if not keys or not segs:
+        return None, "none", None
+    best = []  # (score, set fit, card)
+    title_number = split_card_name(" - ".join(segs))[1]  # a collector number anywhere in the card part counts
+    for key in keys:
+        tables = index.cards(key)
+        set_words = set(card_key(index.data["groups"][key]["name"]).split())
+        for k in range(len(segs), 0, -1):
+            text = " - ".join(segs[:k])
+            rest = set(card_key(" - ".join(segs[k:])).split())
+            set_fit = len(rest & set_words) / len(rest | set_words) if rest else 0.5
+            b, num, treat = split_card_name(text)
+            num = num or title_number
+            exact = tables["exact"].get(card_key(text), [])
+            for card in exact:
+                if not same_number(num, card["num"]):
+                    continue
+                best.append((1.0 if len(exact) == 1 or num else 0.7, set_fit, card))
+            if exact:
+                break
+            for card in tables["base"].get(b, []):
+                if not same_number(num, card["num"]):
+                    continue
+                score = 0.6 + (0.25 if num and card["num"] else 0)
+                score += 0.15 if treat == card["treat"] else -0.1 * len(treat ^ card["treat"])
+                best.append((round(score, 3), set_fit, card))
+    if not best:
+        return None, "none", None
+    best.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    score, fit, card = best[0]
+    rivals = [x for x in best[1:] if x[0] == score and x[2]["id"] != card["id"] and abs(x[1] - fit) < 1e-9]
+    confident = score >= 0.85 and not rivals
+    return card, ("auto" if confident else "check"), min(score, 1.0)
 
 
 # ---------------------------------------------------------------- comparison
@@ -812,59 +1428,176 @@ def set_override(config, title, variant, **fields):
         config["overrides"].append(entry)
 
 
-def match_listing(config, index, item):
-    """Returns (refs, how, score, alternatives). how: 'saved', 'auto', 'check', 'none', 'ignored'."""
+def override_lookup(config):
+    """find_override for many listings at once: {normalized title: {variant (lower) or "": override}}."""
+    table = {}
+    for o in config["overrides"]:
+        slot = table.setdefault(normalize_title(o["shopify_title"]), {})
+        slot.setdefault((o.get("variant") or "").lower(), o)
+    return lambda title, variant: (lambda slot: slot.get((variant or "").lower()) or slot.get(""))(
+        table.get(normalize_title(title), {})) if table else None
+
+
+def match_listing(config, index, item, override=None, memo=None):
+    """Returns (refs, how, score, alternatives). how: 'saved', 'auto', 'check', 'none', 'ignored'.
+    memo: automatic matches remembered from earlier checks (valid while the TCGplayer catalogue is unchanged)."""
     settings = config["settings"]
-    override = find_override(config, item["title"], item["variant"])
+    if override is None:
+        override = find_override(config, item["title"], item["variant"])
     if override:
         if override.get("ignore"):
             return [], "ignored", None, []
         refs = [index.product(t["category"], t["group"], t["product"]) for t in override.get("tcg", [])]
-        refs = [r for r in refs if r]
+        refs = [dict(r, finish=t["finish"]) if t.get("finish") else r
+                for r, t in zip(refs, override.get("tcg", [])) if r]
         if refs or override.get("self_priced"):
             return refs, "saved", None, []
     text = f"{item['title']} {item['variant']}"
+    if memo is not None and text in memo:
+        ids, how, score = memo[text]
+        refs = [index.product(*i) for i in ids]
+        if all(refs):
+            return refs, how, score, []
     cands = index.candidates(text, limit=5)
     if not cands or cands[0][0] < settings["check_match_score"]:
-        return [], "none", cands[0][0] if cands else None, cands
-    best_score, best = cands[0]
-    runner_up = cands[1][0] if len(cands) > 1 else 0
-    query = words(SHOPIFY_NOISE.sub(" ", text))
-    same_kind = query & QUALIFIERS <= best["all_words"]
-    # a rare word of ours (e.g. "Nightfall") missing from their product usually means a different product
-    # (set codes and years like "OP-14" or "2026" are ours, so words with digits don't count)
-    missing_rare = any(index.weight(w) >= RARE_WORD_WEIGHT and not re.search(r"\d", w)
-                       for w in query - best["all_words"])
-    confident = (best_score >= settings["auto_match_score"] and best_score - runner_up >= 0.05
-                 and same_kind and not missing_rare)
-    return [best], ("auto" if confident else "check"), best_score, cands
+        result = [], "none", cands[0][0] if cands else None, cands
+    else:
+        best_score, best = cands[0]
+        runner_up = cands[1][0] if len(cands) > 1 else 0
+        query = words(SHOPIFY_NOISE.sub(" ", text))
+        same_kind = query & QUALIFIERS <= best["all_words"]
+        # a rare word of ours (e.g. "Nightfall") missing from their product usually means a different product
+        # (set codes and years like "OP-14" or "2026" are ours, so words with digits don't count)
+        missing_rare = any(index.weight(w) >= RARE_WORD_WEIGHT and not re.search(r"\d", w)
+                           for w in query - best["all_words"])
+        confident = (best_score >= settings["auto_match_score"] and best_score - runner_up >= 0.05
+                     and same_kind and not missing_rare)
+        result = [best], ("auto" if confident else "check"), best_score, cands
+    if memo is not None:
+        memo[text] = ([(r["category"], r["group"], r["id"]) for r in result[0]], result[1], result[2])
+    return result
 
 
-def build_rows(config, shopify_items, index, progress=None, tcg_updated=""):
+def sort_rows(rows):
+    rows.sort(key=lambda r: (TAG_ORDER[r["tag"]], not r["presale"], -abs(r["diff_pct"] or 0), r["shopify_title"]))
+
+
+def has_stock(row):
+    s = row.get("stock")
+    return isinstance(s, (int, float)) and s > 0
+
+
+def build_rows(config, shopify_items, index, progress=None, tcg_updated="", memo=None, timings=None):
+    """One row per listing: every active (and, if wanted, draft) Shopify variant.
+    Sealed product and TCG singles are compared with TCGplayer; everything else is NO PRICE SOURCE."""
     settings = config["settings"]
     field = settings.get("tcg_price_field", "marketPrice")
-    listings = [i for i in shopify_items if is_tracked(i, settings)]
     new_since = (dt.date.today() - dt.timedelta(days=settings.get("new_release_days", 30))).isoformat()
+    timings = timings if timings is not None else {}
+    clock = time.perf_counter()
+    lookup = override_lookup(config)
+    live_by = {}
+    for e in config.get("live_prices", []):
+        live_by.setdefault((normalize_title(e["shopify_title"]), (e.get("variant") or "").lower()), []).append(e)
+    cond_pct = settings.get("condition_pct") or DEFAULT_SETTINGS["condition_pct"]
 
-    matched = []
-    for n, item in enumerate(listings, 1):
-        matched.append((item, *match_listing(config, index, item)))
-        if progress and n % 100 == 0:
-            progress(f"Matching products: {n} of {len(listings)}")
-    index.load_prices([(r["category"], r["group"]) for _, refs, *_ in matched for r in refs], progress)
+    listings = []
+    for item in shopify_items:
+        if status_ok(item, settings):
+            kind, game = item_kind(item, settings)
+            listings.append((item, kind, game, lookup(item["title"], item["variant"])))
 
-    rows = []
-    for item, refs, how, score, cands in matched:
-        if how == "ignored":
+    # single cards: download the card lists of every set we stock singles from (only changed sets), in parallel
+    want = set()
+    for item, kind, game, o in listings:
+        if kind != "single":
             continue
-        override = find_override(config, item["title"], item["variant"]) or {}
-        prices = [index.price(r["category"], r["group"], r["id"], field) for r in refs]
+        for t in (o or {}).get("tcg", []):
+            want.add(f"{t['category']}/{t['group']}")
+        cats = [game] if game is not None else settings.get("tcg_categories", [])
+        for m in PAREN.finditer(item["title"]):
+            for c in cats:
+                want.update(index.groups_for_code(c, m.group(1)))
+    if want:
+        index.ensure_cards(want, progress)
+    timings["card lists"] = time.perf_counter() - clock
+
+    clock = time.perf_counter()
+    matched = []
+    sealed_memo = None if memo is None else memo.setdefault("sealed", {})
+    single_memo = {}  # the same card in several conditions is matched once
+    for n, (item, kind, game, override) in enumerate(listings, 1):
+        if kind == "other":
+            if override and override.get("ignore"):
+                continue
+            matched.append((item, kind, override, [], "nosource", None, None))
+            continue
+        if kind == "single":
+            if override and override.get("ignore"):
+                continue
+            how = None
+            if override and override.get("tcg"):  # a confirmed / chosen card
+                refs, how, score, _ = match_listing(config, index, item, override)
+                how = how if refs else None
+            if how is None:
+                key = (item["title"], game)
+                if key not in single_memo:
+                    single_memo[key] = match_single(index, item, game, settings)
+                card, how, score = single_memo[key]
+                refs = [index.card_ref(card)] if card else []
+            info = single_details(item)
+            if refs and refs[0]["category"] == 85 and game != 85:
+                info["language"] = "japanese"  # found in TCGplayer's Pokemon Japan sets
+            if (how != "saved" and info["language"] != "english" and refs
+                    and not (game == 85 and info["language"] == "japanese")):
+                how = "check"  # TCGplayer prices are for English cards: don't guess
+            matched.append((item, kind, override, refs, how, score, info))
+        else:
+            refs, how, score, _ = match_listing(config, index, item, override or {}, sealed_memo)
+            if how == "ignored":
+                continue
+            matched.append((item, kind, override, refs, how, score, None))
+        if progress and n % 2000 == 0:
+            progress(f"Matching products: {n} of {len(listings)}")
+    timings["match"] = time.perf_counter() - clock
+
+    clock = time.perf_counter()
+    index.load_prices({(r["category"], r["group"]) for m in matched for r in m[3]}, progress, remember=())
+    timings["prices"] = time.perf_counter() - clock
+
+    clock = time.perf_counter()
+    rows, remember = [], []
+    for item, kind, override, refs, how, score, info in matched:
+        override = override or {}
+        condition = finish_note = ""
+        factor = 1.0
+        finishes, unsure = [], False
+        if kind == "single":
+            condition = info["condition"]
+            factor = float(cond_pct.get(condition, 100)) / 100
+            for r in refs:
+                f = r.get("finish")
+                if not f:
+                    f, sure = resolve_finish(index.finishes(r["category"], r["group"], r["id"]),
+                                             info["finish"], info["edition"])
+                    unsure = unsure or not sure
+                finishes.append(f)
+                if f:
+                    remember.append((r["category"], r["group"], r["id"], f))
+            if unsure and how == "auto":
+                how = "check"
+        else:
+            finishes = [None] * len(refs)
+        prices = [index.price(r["category"], r["group"], r["id"], field, f) for r, f in zip(refs, finishes)]
         values = [p[0] for p in prices if p[0] is not None]
-        snapshot_price = market = sum(values) / len(values) if values else None
+        snapshot_price = market = sum(values) / len(values) * factor if values else None
         as_of = max((p[1] for p in prices if p[0] is not None and p[1]), default="")  # "" = today's snapshot
         # a typed price is replaced once a newer snapshot has today's price; otherwise it keeps counting
-        live = find_live_price(config, item["title"], item["variant"],
-                               tcg_updated if values and not as_of else "")
+        live = None
+        entries = live_by.get((normalize_title(item["title"]), (item["variant"] or "").lower()))
+        if entries:
+            snapshot = parse_time(tcg_updated if values and not as_of else "")
+            live = next((e for e in entries if snapshot is None or parse_time(e["entered"]) > snapshot), None)
         if live:
             market = live["price"]
         ours = item["price"]
@@ -877,7 +1610,9 @@ def build_rows(config, shopify_items, index, progress=None, tcg_updated=""):
                    or is_presale_text(item["tags"]) or is_presale_text(item["title"]))
         self_priced = bool(override.get("self_priced")) or has_any_word(item["title"], settings.get("self_priced_words", []))
 
-        if not ours:
+        if how == "nosource":
+            tag = "NO PRICE SOURCE"
+        elif not ours:
             tag = "NO DATA"
         elif self_priced:
             tag = "SELF-PRICED"
@@ -891,34 +1626,54 @@ def build_rows(config, shopify_items, index, progress=None, tcg_updated=""):
         else:
             tag = classify(diff, presale, settings)
 
+        source = ""
+        if live:
+            source = "price typed in from TCGplayer's site"
+        elif values:
+            source = (FIELD_NAMES.get(field, field) + (f" (average of {len(values)})" if len(values) > 1 else "")
+                      + (f", last seen {as_of} (no listings since)" if as_of else " from the daily snapshot"))
+            if kind == "single":
+                source += (f", {'/'.join(f for f in finishes if f)}"
+                           + (f", × {factor * 100:g}% for {CONDITIONS[condition]}" if condition != "NM" else ""))
+        note = override.get("note", "")
+        if kind == "single" and info["language"] != "english" and refs:
+            note = (note + " · " if note else "") + (
+                "Japanese set (TCGplayer's Pokemon Japan prices): please confirm the match"
+                if refs[0]["category"] == 85 else
+                f"{info['language'].title()} card: TCGplayer's price is for the English card, please check")
         rows.append({
             "shopify_title": item["title"],
             "variant": item["variant"],
+            "kind": kind,
             "channel": "POS" if is_pos(item["title"]) else "Online",
             "status": item["status"],
             "type": item.get("type", ""),
             "stock": item["stock"],
+            "locations": item.get("locations"),
             "our_price": ours,
             "compare_at": item["compare_at"],
             "cost": cost,
             "margin_pct": margin(ours, cost),            # profit at our price, % of price
             "tcg_margin_pct": margin(market, cost),      # profit if we priced at TCGplayer
             "below_cost": bool(cost and market is not None and market < cost),
-            "tcg_refs": [{"category": r["category"], "group": r["group"], "product": r["id"]} for r in refs],
+            "tcg_refs": [{"category": r["category"], "group": r["group"], "product": r["id"],
+                          **({"finish": f} if f else {})} for r, f in zip(refs, finishes)],
             "tcg_name": " | ".join(r["name"] for r in refs),
             "tcg_set": " | ".join(dict.fromkeys(r["set"] for r in refs)),
             "tcg_urls": [r["url"] for r in refs if r.get("url")],
             "tcg_price": market,
-            "tcg_low": min((p[2] for p in prices if p[2] is not None), default=None),
-            "source": ("price typed in from TCGplayer's site" if live else
-                       (FIELD_NAMES.get(field, field) + (f" (average of {len(values)})" if len(values) > 1 else "")
-                        + (f", last seen {as_of} (no listings since)" if as_of else " from the daily snapshot"))
-                       if values else ""),
+            "tcg_low": (lambda lows: min(lows) * factor if lows else None)([p[2] for p in prices if p[2] is not None]),
+            "source": source,
             "price_as_of": "" if live else as_of,
-            "match": {"saved": "Confirmed", "auto": "Automatic", "check": "Needs check", "none": "Not found"}[how],
+            "match": {"saved": "Confirmed", "auto": "Automatic", "check": "Needs check", "none": "Not found",
+                      "nosource": "No price source"}[how],
             "match_score": score,
+            "condition": condition,
+            "finish": " | ".join(f for f in finishes if f),
             "diff_amt": diff_amt,
             "diff_pct": diff,
+            # what our price should become: the TCGplayer price (condition-adjusted for singles)
+            "suggested_price": round(market, 2) if tag in NEED_UPDATE and market else None,
             "presale": presale,
             "release": next((r["release"] for r in refs if r.get("release")), ""),
             # presale / just released: TCGplayer prices can move a lot between daily snapshots
@@ -926,9 +1681,12 @@ def build_rows(config, shopify_items, index, progress=None, tcg_updated=""):
             "snapshot_price": snapshot_price,
             "live_entered": live["entered"] if live else "",
             "tag": tag,
-            "note": override.get("note", ""),
+            "note": note,
         })
-    rows.sort(key=lambda r: (TAG_ORDER[r["tag"]], not r["presale"], -abs(r["diff_pct"] or 0), r["shopify_title"]))
+    if remember and index.snapshot_date:
+        index._remember([], remember)
+    sort_rows(rows)
+    timings["rows"] = time.perf_counter() - clock
     return rows
 
 
@@ -950,15 +1708,24 @@ class PriceChecker:
         self.tcg_updated = ""
         self.checked_at = ""   # when the rows were last worked out (shown when reopening the app)
         self.stage = ""        # "shopify" / "tcgplayer" while running, for error messages
+        self.notes = []        # things to say once in the status line (e.g. no per-location stock)
+        self.timings = {}      # seconds per step of the last check (--timings)
+        self.memo = None       # automatic sealed matches from earlier checks (cache/match_memo.json)
 
     def save(self):
         save_config(self.config, self.config_path)
 
-    def run(self, progress=print, shopify_csv=None):
+    def run(self, progress=print, shopify_csv=None, use_cache=False):
+        """use_cache: reuse the Shopify products saved by the last check instead of asking Shopify."""
+        self.timings = {}
+        clock = time.perf_counter()
         self.stage = "shopify"
         progress("Connecting to Shopify…")
         if shopify_csv:
             self.shopify_items = list(shopify_from_csv(shopify_csv))
+        elif use_cache:
+            saved = json.loads((self.cache_dir / "shopify_products.json").read_text(encoding="utf-8"))
+            self.shopify_items, self.notes = saved["items"], saved.get("notes", [])
         else:
             problem = check_credentials_file(self.credentials_path)
             if problem and not os.environ.get("SHOPIFY_TOKEN"):
@@ -968,6 +1735,8 @@ class PriceChecker:
                 raise SetupError(f"No Shopify login found. Fill in store_url and client_id/client_secret in the "
                                  f"shopify: section of {self.credentials_path}")
             self.shopify_items = self._read_shopify(creds, progress)
+        self.timings["shopify"] = time.perf_counter() - clock
+        clock = time.perf_counter()
         self.stage = "tcgplayer"
         progress("Checking TCGplayer catalogue for new sets…")
         self.index.refresh(self.config["settings"]["tcg_categories"], progress)
@@ -975,37 +1744,48 @@ class PriceChecker:
         self.tcg_updated = self.index.last_updated()
         self.index.snapshot = self.tcg_updated
         self.index.snapshot_date = self.tcg_updated[:10]
+        self.timings["tcgplayer catalogue"] = time.perf_counter() - clock
         rows = self.recompute(progress)
         self.stage = ""
         self.save_last_check()
         return rows
 
     def _read_shopify(self, creds, progress):
-        """All products the first time each day; after that only products changed since the last check
-        (Shopify marks a product as changed when its price, title, status or variants change)."""
+        """All products the first time each day (one bulk operation); after that only variants and products
+        changed since the last check (Shopify marks a variant as changed when its price or stock changes)."""
         path = self.cache_dir / "shopify_products.json"
         now = dt.datetime.now(dt.timezone.utc)
+        reader = ShopifyReader(*creds, progress=progress, use_bulk=self.config["settings"].get("shopify_bulk", True))
         try:
             saved = json.loads(path.read_text(encoding="utf-8"))
             full_at, fetched_at = parse_time(saved["full_at"]), parse_time(saved["fetched_at"])
             fresh = (saved.get("store") == creds[0] and full_at.astimezone().date() == now.astimezone().date()
-                     and all(i.get("product_id") for i in saved["items"]))
+                     and all(i.get("variant_id") for i in saved["items"]))
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             saved, fresh = None, False
         if fresh:
             since = (fetched_at - dt.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            changed = list(shopify_from_api(*creds, progress=progress, changed_since=since))
-            ids = {i["product_id"] for i in changed}
-            items = [i for i in saved["items"] if i["product_id"] not in ids] + changed
-            progress(f"Shopify: {len(ids)} products changed since the last check")
+            reader.levels = saved.get("levels", True)
+            changed = reader.variants(changed_since=since)
+            products = reader.changed_products(since)
+            ids = {i["variant_id"] for i in changed}
+            items = [i for i in saved["items"] if i["variant_id"] not in ids] + changed
+            for i in items:
+                if i["product_id"] in products:
+                    i.update(products[i["product_id"]])
+            progress(f"Shopify: {len(ids)} variants and {len(products)} products changed since the last check")
             full_at = saved["full_at"]
+            notes = saved.get("notes", []) + [n for n in reader.notes if n not in saved.get("notes", [])]
         else:
-            items = list(shopify_from_api(*creds, progress=progress))
+            items = reader.variants()
             full_at = now.isoformat()
+            notes = reader.notes
+        self.notes = notes
+        self.timings["shopify read"] = reader.how or "cached"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"store": creds[0], "full_at": full_at, "fetched_at": now.isoformat(),
-                                        "items": items}), encoding="utf-8")
+                                        "levels": reader.levels, "notes": notes, "items": items}), encoding="utf-8")
         except OSError:
             pass
         return items
@@ -1015,7 +1795,8 @@ class PriceChecker:
         self.checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
         try:
             (self.cache_dir / "last_check.json").write_text(json.dumps(
-                {"checked_at": self.checked_at, "tcg_updated": self.tcg_updated, "rows": self.rows}), encoding="utf-8")
+                {"checked_at": self.checked_at, "tcg_updated": self.tcg_updated, "notes": self.notes,
+                 "rows": self.rows}), encoding="utf-8")
         except OSError:
             pass
 
@@ -1027,6 +1808,13 @@ class PriceChecker:
         except (OSError, ValueError, KeyError):
             return False
         self.rows, self.tcg_updated, self.checked_at = last["rows"], last["tcg_updated"], last["checked_at"]
+        self.notes = last.get("notes", [])
+        for r in self.rows:  # results saved by an older version of the app
+            r.setdefault("kind", "sealed")
+            r.setdefault("locations", None)
+            r.setdefault("suggested_price", None)
+            r.setdefault("condition", "")
+            r.setdefault("finish", "")
         self.shopify_items = items
         self.index.snapshot = self.tcg_updated
         self.index.snapshot_date = self.tcg_updated[:10]
@@ -1041,8 +1829,34 @@ class PriceChecker:
         hours = (dt.datetime.now(dt.timezone.utc) - t).total_seconds() / 3600
         return local.strftime("%b %d, %I:%M %p").replace(" 0", " "), hours
 
+    def _match_memo(self):
+        """Automatic sealed matches from earlier checks, kept while the sealed catalogue and the match
+        settings are unchanged (so only new or changed listings are matched again)."""
+        s = self.config["settings"]
+        stamp = "|".join(str(x) for x in (self.index.sealed_stamp(), s["auto_match_score"], s["check_match_score"]))
+        if self.memo is None or self.memo.get("stamp") != stamp:
+            try:
+                memo = json.loads((self.cache_dir / "match_memo.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                memo = {}
+            self.memo = memo if memo.get("stamp") == stamp else {"stamp": stamp, "sealed": {}}
+            for v in self.memo["sealed"].values():
+                v[0] = [tuple(i) for i in v[0]]
+        return self.memo
+
+    def _save_memo(self):
+        try:
+            (self.cache_dir / "match_memo.json").write_text(json.dumps(self.memo), encoding="utf-8")
+        except (OSError, TypeError):
+            pass
+
     def recompute(self, progress=None):
-        self.rows = build_rows(self.config, self.shopify_items or [], self.index, progress, self.tcg_updated)
+        memo = self._match_memo()
+        before = len(memo["sealed"])
+        self.rows = build_rows(self.config, self.shopify_items or [], self.index, progress, self.tcg_updated,
+                               memo=memo, timings=self.timings)
+        if len(memo["sealed"]) != before:
+            self._save_memo()
         return self.rows
 
     def recompute_title(self, title):
@@ -1050,15 +1864,25 @@ class PriceChecker:
         key = normalize_title(title)
         items = [i for i in self.shopify_items or [] if normalize_title(i["title"]) == key]
         self.rows = [r for r in self.rows if normalize_title(r["shopify_title"]) != key]
-        self.rows += build_rows(self.config, items, self.index, tcg_updated=self.tcg_updated)
-        self.rows.sort(key=lambda r: (TAG_ORDER[r["tag"]], not r["presale"], -abs(r["diff_pct"] or 0), r["shopify_title"]))
+        self.rows += build_rows(self.config, items, self.index, tcg_updated=self.tcg_updated, memo=self.memo)
+        sort_rows(self.rows)
 
-    def search_tcg(self, text, limit=40):
-        """TCGplayer sealed products for the match picker, with today's price: [(score, product, price)]."""
-        cands = self.index.candidates(text, limit=limit)
+    def search_tcg(self, text, limit=40, single=False, categories=None):
+        """TCGplayer products for the match picker, with today's price: [(score, product, price)].
+        single: search single cards (in the sets downloaded so far) instead of sealed product."""
+        if single:
+            cands = self.index.search_cards(text, categories, limit=limit)
+        else:
+            cands = self.index.candidates(text, limit=limit)
         self.index.load_prices([(p["category"], p["group"]) for _, p in cands])
         field = self.config["settings"].get("tcg_price_field", "marketPrice")
-        return [(s, p, self.index.price(p["category"], p["group"], p["id"], field)[0]) for s, p in cands]
+        out = []
+        for s, p in cands:
+            finish = None
+            if single:
+                finish, _ = resolve_finish(self.index.finishes(p["category"], p["group"], p["id"]), None, None)
+            out.append((s, p, self.index.price(p["category"], p["group"], p["id"], field, finish)[0]))
+        return out
 
     def product_types(self):
         """Product types in our shop with listing counts, most common first."""
@@ -1067,42 +1891,74 @@ class PriceChecker:
             counts[i.get("type") or ""] = counts.get(i.get("type") or "", 0) + 1
         return sorted(counts.items(), key=lambda kv: -kv[1])
 
-    def write_reports(self):
+    def locations(self):
+        """Every Shopify location that holds stock of anything listed, in name order."""
+        names = set()
+        for r in self.rows:
+            names.update(r.get("locations") or ())
+        return sorted(names, key=str.lower)
+
+    def write_reports(self, show_zero=None):
+        """HTML + CSV report, plus need_update CSV (URGENT and DRIFTING rows with the suggested price).
+        Out-of-stock rows are left out unless show_zero (default: the show_zero_stock setting)."""
+        if show_zero is None:
+            show_zero = self.config["settings"].get("show_zero_stock", False)
         report_date = dt.date.today().isoformat()
         self.out_dir.mkdir(parents=True, exist_ok=True)
         html_path = self.out_dir / f"price_report_{report_date}.html"
         csv_path = self.out_dir / f"price_report_{report_date}.csv"
-        write_html(self.rows, html_path, self.config["settings"], report_date, self.tcg_updated)
-        write_csv(self.rows, csv_path)
+        need_path = self.out_dir / f"need_update_{report_date}.csv"
+        rows = self.rows if show_zero else [r for r in self.rows if has_stock(r)]
+        hidden = len(self.rows) - len(rows)
+        locations = self.locations()
+        write_html(rows, html_path, self.config["settings"], report_date, self.tcg_updated,
+                   locations=locations, hidden=hidden, notes=self.notes)
+        write_csv(rows, csv_path, locations)
+        write_csv([r for r in rows if r["tag"] in NEED_UPDATE], need_path, locations)
         return html_path, csv_path
 
 
 # ---------------------------------------------------------------- output
 
-CSV_COLUMNS = ["tag", "presale", "release", "channel", "shopify_title", "variant", "type", "our_price", "cost",
-               "margin_pct", "tcg_price", "tcg_margin_pct", "below_cost", "diff_amt", "diff_pct", "tcg_low", "match",
-               "match_score", "tcg_name", "tcg_set", "source", "price_as_of", "snapshot_price", "live_entered", "fast_moving", "status",
-               "stock", "note"]
+CSV_COLUMNS = ["tag", "presale", "release", "channel", "kind", "shopify_title", "variant", "type", "condition",
+               "finish", "our_price", "suggested_price", "cost", "margin_pct", "tcg_price", "tcg_margin_pct",
+               "below_cost", "diff_amt", "diff_pct", "tcg_low", "match", "match_score", "tcg_name", "tcg_set", "source",
+               "price_as_of", "snapshot_price", "live_entered", "fast_moving", "status", "stock", "note"]
 
 
-def write_csv(rows, path):
-    # diff_amt / diff_pct = our price minus TCGplayer
+def write_csv(rows, path, locations=()):
+    """diff_amt / diff_pct = our price minus TCGplayer. One "stock: <location>" column per Shopify location."""
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(CSV_COLUMNS)
+        w.writerow(CSV_COLUMNS + [f"stock: {name}" for name in locations])
         for r in rows:
-            w.writerow([round(r[c], 2) if isinstance(r[c], float) else r[c] for c in CSV_COLUMNS])
+            at = r.get("locations") or {}
+            w.writerow([round(v, 2) if isinstance(v, float) else v for v in (r.get(c) for c in CSV_COLUMNS)]
+                       + [at.get(name, 0) if r.get("locations") is not None else "" for name in locations])
 
 
 def tag_class(tag):
     return re.sub(r"[^a-z]", "", tag.lower())
 
 
-def write_html(rows, path, settings, report_date, tcg_updated):
+def stock_text(v):
+    return "" if v in (None, "") else str(v)
+
+
+def write_html(rows, path, settings, report_date, tcg_updated, locations=(), hidden=0, notes=()):
     counts = {t: sum(r["tag"] == t for r in rows) for t in TAG_ORDER}
     presale_count = sum(r["presale"] for r in rows)
+    need_count = sum(r["tag"] in NEED_UPDATE for r in rows)
     body = []
     for r in rows:
+        at = r.get("locations")
+        stock_cells = "".join(
+            f'<td class="num{" zero" if not (at or {}).get(name) else ""}">{stock_text((at or {}).get(name, 0) if at is not None else "")}</td>'
+            for name in locations)
+        suggested = (f'<div class="sub suggest">set to <b>{money(r["suggested_price"])}</b></div>'
+                     if r.get("suggested_price") else "")
+        extra = " · ".join(x for x in (r.get("condition") and CONDITIONS.get(r["condition"], r["condition"]),
+                                        r.get("finish")) if x)
         if r["diff_pct"] is None:
             action = ""
         elif r["diff_pct"] > 0:
@@ -1111,21 +1967,27 @@ def write_html(rows, path, settings, report_date, tcg_updated):
             action = "We're below TCGplayer"
         links = " ".join(f'<a href="{html.escape(u)}" target="_blank">TCGplayer</a>' for u in r["tcg_urls"][:1])
         diff_cls = "" if r["diff_pct"] is None else ("up" if r["diff_pct"] > 0 else "down")
-        body.append(f"""<tr class="row-{tag_class(r['tag'])}{' row-presale' if r['presale'] else ''}{' row-belowcost' if r['below_cost'] else ''}{' row-fast' if r['fast_moving'] else ''}">
+        body.append(f"""<tr class="row-{tag_class(r['tag'])} row-{r.get('kind', 'sealed')}{' row-needupdate' if r['tag'] in NEED_UPDATE else ''}{' row-presale' if r['presale'] else ''}{' row-belowcost' if r['below_cost'] else ''}{' row-fast' if r['fast_moving'] else ''}">
   <td><span class="tag t-{tag_class(r['tag'])}">{r['tag']}</span>{' <span class="tag t-presale">PRESALE</span>' if r['presale'] else ''}{' <span class="tag t-fast" title="Price can move a lot between daily snapshots - check live">⚡ FAST-MOVING</span>' if r['fast_moving'] else ''}</td>
   <td><div class="title">{html.escape(r['shopify_title'])}{(' — ' + html.escape(r['variant'])) if r['variant'] else ''}</div>
-      <div class="sub">{r['channel']} · {html.escape(r['type'])}{' · stock ' + str(r['stock']) if r['stock'] not in (None, '') else ''}</div>
+      <div class="sub">{r['channel']} · {html.escape(r['type'])}{(' · ' + html.escape(extra)) if extra else ''}</div>
       {f'<div class="sub">{html.escape(r["note"])}</div>' if r['note'] else ''}</td>
   <td class="num">{money(r['our_price'])}{f'<div class="sub">was {money(r["compare_at"])}</div>' if r['compare_at'] else ''}</td>
   <td class="num">{money(r['cost'])}{f'<div class="sub">margin {r["margin_pct"]:.0f}%</div>' if r['margin_pct'] is not None else ''}</td>
   <td class="num">{money(r['tcg_price'])}{f'<div class="sub">typed in (snapshot {money(r["snapshot_price"])})</div>' if r['live_entered'] else ''}{f'<div class="sub">low {money(r["tcg_low"])}</div>' if r['tcg_low'] is not None else ''}{f'<div class="sub{" neg" if r["tcg_margin_pct"] < 0 else ""}">margin {r["tcg_margin_pct"]:.0f}%{" · below cost" if r["below_cost"] else ""}</div>' if r['tcg_margin_pct'] is not None else ''}</td>
-  <td class="num {diff_cls}"><b>{pct(r['diff_pct'])}</b><div class="sub">{('+' if (r['diff_amt'] or 0) > 0 else '') + money(r['diff_amt']) if r['diff_amt'] is not None else ''}</div><div class="sub">{action}</div></td>
+  <td class="num {diff_cls}"><b>{pct(r['diff_pct'])}</b><div class="sub">{('+' if (r['diff_amt'] or 0) > 0 else '') + money(r['diff_amt']) if r['diff_amt'] is not None else ''}</div><div class="sub">{action}</div>{suggested}</td>
+  <td class="num"><b>{stock_text(r['stock'])}</b></td>{stock_cells}
   <td><div>{html.escape(r['tcg_name'] or '—')}</div><div class="sub">{html.escape(r['tcg_set'])}</div>
       <div class="sub">{r['match']}{(' · releases ' + r['release']) if r['presale'] and r['release'] else ''} {links}</div></td>
 </tr>""")
     cards = "".join(f'<div class="card"><b class="c-{tag_class(t)}">{counts[t]}</b>{t.title()}</div>'
                     for t in TAG_ORDER if counts[t])
-    buttons = "".join(f'<button data-f="{tag_class(t)}">{t.title()}</button>' for t in TAG_ORDER if counts[t])
+    buttons = "".join(f'<button data-f="{tag_class(t)}">{t.title()} ({counts[t]})</button>' for t in TAG_ORDER if counts[t])
+    kinds = {k: sum(r.get("kind", "sealed") == k for r in rows) for k in ("sealed", "single")}
+    loc_heads = "".join(f'<th class="num">{html.escape(name)}</th>' for name in locations)
+    hidden_note = (f" · {hidden} out-of-stock listings not shown (tick 'Show out of stock' in the app, or run with "
+                   f"--show-zero, to include them)" if hidden else "")
+    notes_html = "".join(f'<div class="meta warn">{html.escape(n)}</div>' for n in notes)
     page = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Price Check {report_date}</title>
 <style>
@@ -1137,6 +1999,8 @@ h1{{font-size:22px;margin:0 0 4px}} .meta{{color:var(--muted);margin-bottom:16px
 .cards{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}}
 .card{{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 16px;min-width:110px}}
 .card b{{display:block;font-size:22px}}
+.zero{{color:var(--muted)}} .suggest{{color:var(--fg)}} .warn{{color:var(--amber)}}
+.search{{margin:0 0 10px;padding:6px 10px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);width:min(420px,100%)}}
 .c-urgent{{color:var(--red)}} .c-drifting{{color:var(--amber)}} .c-ok{{color:var(--green)}} .c-checkmatch{{color:var(--blue)}}
 .filters{{margin-bottom:10px;display:flex;gap:6px;flex-wrap:wrap}}
 .filters button{{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:16px;padding:4px 12px;cursor:pointer}}
@@ -1154,20 +2018,23 @@ th{{font-size:12px;color:var(--muted);font-weight:600;position:sticky;top:0;back
 a{{color:var(--blue)}}
 </style></head><body><main>
 <h1>Shopify vs TCGplayer — {report_date}</h1>
-<div class="meta">{len(rows)} sealed listings · TCGplayer prices are tcgcsv's daily snapshot from {html.escape(tcg_updated)} (UTC) - ⚡ items may have moved since · Diff = our price vs TCGplayer ·
-Drifting ≥ {settings['drift_pct']}% / Urgent ≥ {settings['urgent_pct']}% (presale: {settings['presale_drift_pct']}% / {settings['presale_urgent_pct']}%)</div>
+<div class="meta">{len(rows)} listings{hidden_note} · TCGplayer prices are tcgcsv's daily snapshot from {html.escape(tcg_updated)} (UTC) - ⚡ items may have moved since · Diff = our price vs TCGplayer ·
+Drifting ≥ {settings['drift_pct']}% / Urgent ≥ {settings['urgent_pct']}% (presale: {settings['presale_drift_pct']}% / {settings['presale_urgent_pct']}%) ·
+Singles: TCGplayer Near Mint price × condition ({", ".join(f"{k} {v:g}%" for k, v in (settings.get("condition_pct") or {}).items())}) · Stock = Shopify available quantity, per location</div>{notes_html}
 <div class="cards">{cards}<div class="card"><b style="color:var(--blue)">{presale_count}</b>Presale</div></div>
-<div class="filters"><button class="on" data-f="all">All</button>{buttons}<button data-f="presale">Presale</button><button data-f="belowcost">TCGplayer below our cost</button><button data-f="fast">⚡ Fast-moving</button></div>
+<div class="filters"><button class="on" data-f="all">All ({len(rows)})</button><button data-f="needupdate">Need update ({need_count})</button>{buttons}<button data-f="sealed">Sealed ({kinds['sealed']})</button><button data-f="single">Singles ({kinds['single']})</button><button data-f="presale">Presale</button><button data-f="belowcost">TCGplayer below our cost</button><button data-f="fast">⚡ Fast-moving</button></div>
+<input class="search" type="search" placeholder="Search products…" aria-label="Search products">
 <div class="wrap"><table>
-<thead><tr><th>Tag</th><th>Shopify product</th><th class="num">Our price</th><th class="num">Cost</th><th class="num">TCGplayer</th><th class="num">Us vs TCG</th><th>TCGplayer match</th></tr></thead>
+<thead><tr><th>Tag</th><th>Shopify product</th><th class="num">Our price</th><th class="num">Cost</th><th class="num">TCGplayer</th><th class="num">Us vs TCG</th><th class="num">Stock</th>{loc_heads}<th>TCGplayer match</th></tr></thead>
 <tbody>{''.join(body)}</tbody></table></div>
 </main>
 <script>
+let f='all';const q=document.querySelector('.search');const rows=[...document.querySelectorAll('tbody tr')];
+function apply(){{const n=q.value.trim().toLowerCase();
+  rows.forEach(tr=>{{tr.style.display=((f==='all'||tr.classList.contains('row-'+f))&&(!n||tr.textContent.toLowerCase().includes(n)))?'':'none';}});}}
 document.querySelectorAll('.filters button').forEach(b=>b.onclick=()=>{{
-  document.querySelectorAll('.filters button').forEach(x=>x.classList.toggle('on',x===b));
-  const f=b.dataset.f;
-  document.querySelectorAll('tbody tr').forEach(tr=>{{tr.style.display=(f==='all'||tr.classList.contains('row-'+f))?'':'none';}});
-}});
+  document.querySelectorAll('.filters button').forEach(x=>x.classList.toggle('on',x===b));f=b.dataset.f;apply();}});
+q.oninput=apply;
 </script></body></html>"""
     path.write_text(page, encoding="utf-8")
 
@@ -1177,12 +2044,16 @@ document.querySelectorAll('.filters button').forEach(b=>b.onclick=()=>{{
 import tkinter as tk  # noqa: E402
 from tkinter import filedialog, messagebox, simpledialog, ttk  # noqa: E402
 
-FILTERS = [("All", None), ("Urgent", "URGENT"), ("Drifting", "DRIFTING"), ("Check match", "CHECK MATCH"),
-           ("OK", "OK"), ("Presale", "presale"), ("⚡ Fast-moving", "fast_moving"), ("Below cost", "below_cost"), ("We price", "SELF-PRICED"),
-           ("Not on TCGplayer", "NO MATCH"),
-           ("No price", "NO PRICE"), ("No data", "NO DATA")]
+FILTERS = [("All", None), ("Need update", "need_update"), ("Urgent", "URGENT"), ("Drifting", "DRIFTING"),
+           ("Check match", "CHECK MATCH"), ("OK", "OK"), ("Presale", "presale"), ("⚡ Fast-moving", "fast_moving"),
+           ("Below cost", "below_cost"), ("We price", "SELF-PRICED"), ("Not on TCGplayer", "NO MATCH"),
+           ("No price", "NO PRICE"), ("No price source", "NO PRICE SOURCE"), ("No data", "NO DATA")]
+KINDS = {"Everything": None, "Sealed": "sealed", "Singles": "single", "Other": "other"}
 ROW_COLORS = {"URGENT": "#fbe3e1", "DRIFTING": "#fff1d6", "CHECK MATCH": "#e3eafc", "OK": "#ffffff",
-              "SELF-PRICED": "#f1f1ef", "NO MATCH": "#f1f1ef", "NO PRICE": "#f1f1ef", "NO DATA": "#f1f1ef"}
+              "SELF-PRICED": "#f1f1ef", "NO MATCH": "#f1f1ef", "NO PRICE": "#f1f1ef", "NO PRICE SOURCE": "#f1f1ef",
+              "NO DATA": "#f1f1ef"}
+FIRST_BATCH = 1500   # rows drawn straight away; the rest are added in the background so the window stays usable
+BATCH = 4000
 COLUMNS = [  # id, heading, width (characters), anchor, sort key
     ("tag", "Status", 12, "w", lambda r: TAG_ORDER[r["tag"]]),
     ("flags", "Flags", 6, "center", lambda r: (not r["presale"], not r["fast_moving"])),
@@ -1194,13 +2065,24 @@ COLUMNS = [  # id, heading, width (characters), anchor, sort key
     ("tcgmargin", "Margin at TCG", 11, "e", lambda r: r["tcg_margin_pct"] if r["tcg_margin_pct"] is not None else -1e9),
     ("diff", "Difference", 9, "e", lambda r: abs(r["diff_pct"] or 0)),
     ("amt", "$ diff", 9, "e", lambda r: abs(r["diff_amt"] or 0)),
+    ("suggest", "Set to", 9, "e", lambda r: r.get("suggested_price") or 0),
+    ("stock", "Stock", 6, "e", lambda r: r["stock"] if isinstance(r["stock"], (int, float)) else -1e9),
     ("match", "TCGplayer product", 32, "w", lambda r: r["tcg_name"].lower()),
     ("how", "Match", 10, "w", lambda r: r["match"]),
 ]
 FLEX_COLUMNS = {"product": 0.6, "match": 0.4}  # these two share whatever width is left
-FLEX_MIN_CHARS = {"product": 26, "match": 20}
+FLEX_MIN_CHARS = {"product": 24, "match": 16}
 # on narrow windows these columns hide, first to last, so product names stay readable (details stay below)
-HIDE_WHEN_NARROW = ["how", "tcgmargin", "margin", "amt", "cost", "flags"]
+HIDE_WHEN_NARROW = ["how", "tcgmargin", "margin", "amt", "cost", "flags", "LOCATIONS"]
+
+
+def short_names(names, size=9):
+    """Short column headings for location names ('Woodland Hills Storefront' -> 'Woodland'), kept unique."""
+    out = {}
+    for name in names:
+        first = (name.split() or [name])[0][:size]
+        out[name] = first if sum((n.split() or [n])[0][:size] == first for n in names) == 1 else name[:size]
+    return out
 HINT = "Double-click a row to open it on TCGplayer · right-click for more options · Help explains the symbols"
 
 
@@ -1209,6 +2091,10 @@ def help_text(s):
     return (f"Status: URGENT = {n(s['urgent_pct'])}%+ away from TCGplayer · DRIFTING = {n(s['drift_pct'])}%+ away "
             f"(presale items: {n(s['presale_urgent_pct'])}% / {n(s['presale_drift_pct'])}%) · CHECK MATCH = please "
             "confirm the TCGplayer product is right. Change these numbers in Settings.\n"
+            "Need update = every URGENT and DRIFTING row; 'Set to' is the suggested new price (the TCGplayer price, "
+            "for singles adjusted for condition). NO PRICE SOURCE = TCGplayer doesn't price it (sports cards, graded "
+            "slabs, accessories...). Stock = total available, then one column per Shopify location. Out-of-stock "
+            "listings are hidden unless 'Show out of stock' is ticked.\n"
             "Margin = profit as % of the price, using Shopify's cost per item. ⚠ = TCGplayer's price is below our cost.\n"
             "TCGplayer prices are a once-a-day snapshot. ★ = presale · ⚡ = fast-moving (presale or new set), check it live "
             "· ✎ = price typed in with 'Enter live price…'.\n"
@@ -1291,6 +2177,11 @@ class App(tk.Tk):
         self.filter = tk.StringVar(value=saved.get("filter") if saved.get("filter") in dict(FILTERS) else "All")
         self.search = tk.StringVar()
         self.sort_key, self.sort_reverse = (saved.get("sort") or [None, False])
+        self.kind = tk.StringVar(value=saved.get("kind") if saved.get("kind") in KINDS else "Everything")
+        self.show_zero = tk.BooleanVar(value=bool(self.checker.config["settings"].get("show_zero_stock")))
+        self.columns = list(COLUMNS)   # plus one stock column per Shopify location, added once they're known
+        self.locations = []
+        self._fill_job = self._search_job = None
         self.visible = []
         self._setup_colors()
         self._setup_fonts()
@@ -1332,8 +2223,9 @@ class App(tk.Tk):
             maximized = False
         settings = self.checker.config["settings"]
         settings["window"] = {"geometry": settings.get("window", {}).get("geometry") if maximized else self.geometry(),
-                              "maximized": maximized, "filter": self.filter.get(),
+                              "maximized": maximized, "filter": self.filter.get(), "kind": self.kind.get(),
                               "sort": [self.sort_key, self.sort_reverse]}
+        settings["show_zero_stock"] = bool(self.show_zero.get())
         try:
             self.checker.save()
         except OSError:
@@ -1437,14 +2329,15 @@ class App(tk.Tk):
             return
         digit = self.fonts["body"].measure("0")
         fixed = {cid: max(chars * digit, self.fonts["bold"].measure(heading) + 18)
-                 for cid, heading, chars, _, _ in COLUMNS if cid not in FLEX_COLUMNS}
+                 for cid, heading, chars, _, _ in self.columns if cid not in FLEX_COLUMNS}
         flex_min = sum(FLEX_MIN_CHARS.values()) * digit
         hidden = []
-        for cid in HIDE_WHEN_NARROW:
+        loc_ids = [c[0] for c in self.columns if c[0].startswith("loc")]
+        for group in HIDE_WHEN_NARROW:
             if sum(w for c, w in fixed.items() if c not in hidden) + flex_min <= avail:
                 break
-            hidden.append(cid)
-        wanted = tuple(c[0] for c in COLUMNS if c[0] not in hidden) if hidden else ("#all",)
+            hidden.extend(loc_ids if group == "LOCATIONS" else [group])
+        wanted = tuple(c[0] for c in self.columns if c[0] not in hidden) if hidden else ("#all",)
         if tuple(self.tk.splitlist(self.tree["displaycolumns"])) != wanted:
             self.tree["displaycolumns"] = wanted
         left = avail - sum(w for c, w in fixed.items() if c not in hidden)
@@ -1483,7 +2376,7 @@ class App(tk.Tk):
         top.add(ttk.Button(top, text="Help", command=self.show_help))
         self.flows.append(top)
 
-        bar = Flow(self, gap=4)
+        bar = self.filter_bar = Flow(self, gap=4)
         bar.pack(fill="x", padx=12, pady=4)
         self.filter_buttons = {}
         for label, _ in FILTERS:
@@ -1494,7 +2387,16 @@ class App(tk.Tk):
         self.search_entry = ttk.Entry(search, textvariable=self.search, width=28)
         self.search_entry.pack(side="left")
         bar.add(search, space_before=14)
-        self.search.trace_add("write", lambda *_: self.refresh_table())
+        kind = ttk.Frame(bar)
+        ttk.Label(kind, text="Show:").pack(side="left", padx=(0, 4))
+        box = ttk.Combobox(kind, textvariable=self.kind, values=list(KINDS), state="readonly", width=11)
+        box.pack(side="left")
+        box.bind("<<ComboboxSelected>>", lambda e: self.refresh_table())
+        bar.add(kind, space_before=10)
+        bar.add(ttk.Checkbutton(bar, text="Show out of stock", variable=self.show_zero,
+                                command=self._toggle_zero), space_before=10)
+        # wait for a pause in typing before redrawing: with a big catalogue every keystroke would redraw
+        self.search.trace_add("write", lambda *_: self._search_soon())
         self.flows.append(bar)
 
         # bottom rows are packed before the table so they stay visible when the window is made small
@@ -1529,10 +2431,8 @@ class App(tk.Tk):
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=12, pady=4)
-        self.tree = ttk.Treeview(body, columns=[c[0] for c in COLUMNS], show="headings", selectmode="browse")
-        for cid, heading, _, anchor, _ in COLUMNS:
-            self.tree.heading(cid, text=heading, command=lambda c=cid: self.sort_by(c))
-            self.tree.column(cid, minwidth=30, anchor=anchor, stretch=False)
+        self.tree = ttk.Treeview(body, columns=[c[0] for c in self.columns], show="headings", selectmode="browse")
+        self._setup_columns()
         self.tree.bind("<Configure>", self._fit_columns, add="+")
         for tag, color in ROW_COLORS.items():
             self.tree.tag_configure(tag, background=color, foreground="#1d1d1b")
@@ -1655,61 +2555,137 @@ class App(tk.Tk):
         age = f"TCGplayer prices from {when} ({hours:.0f} hours old)" if when else "TCGplayer snapshot time unknown"
         checked = parse_time(self.checker.checked_at)
         checked = checked.astimezone().strftime("%b %d, %I:%M %p").replace(" 0", " ") if checked else ""
+        rows = self.checker.rows
+        hidden = 0 if self.show_zero.get() else sum(not has_stock(r) for r in rows)
         lead = (f"Showing the last check ({checked}) · checking for changes…" if refreshing
-                else f"Checked {len(self.checker.rows)} sealed listings")
-        self.status.config(text=f"{lead} · {age}",
-                           foreground=self.colors["warn"] if hours and hours > 30 else self.colors["muted"])
+                else f"Checked {len(rows)} listings" + (f" ({hidden} out of stock hidden)" if hidden else ""))
+        notes = "".join(f" · {n}" for n in self.checker.notes)
+        self.status.config(text=f"{lead} · {age}{notes}",
+                           foreground=self.colors["warn"] if (hours and hours > 30) or notes else self.colors["muted"])
 
     # ------------------------------------------------------------------ table
+    def _setup_columns(self):
+        """(Re)build the table's columns: the fixed ones plus one stock column per Shopify location."""
+        self.locations = self.checker.locations()
+        self.columns = list(COLUMNS)
+        at = next(i for i, c in enumerate(self.columns) if c[0] == "stock") + 1
+        short = short_names(self.locations)
+        for i, name in enumerate(self.locations):  # full names are in the details below the table
+            self.columns.insert(at + i, (f"loc{i}", short[name], 6, "e",
+                                         lambda r, n=name: (r.get("locations") or {}).get(n, 0)))
+        self.tree["displaycolumns"] = ("#all",)
+        self.tree["columns"] = [c[0] for c in self.columns]
+        for cid, heading, _, anchor, _ in self.columns:
+            self.tree.heading(cid, text=heading, command=lambda c=cid: self.sort_by(c))
+            self.tree.column(cid, minwidth=30, anchor=anchor, stretch=False)
+        if self.sort_key and self.sort_key not in self.tree["columns"]:
+            self.sort_key = None
+        self._fit_columns()
+
     def _row_text(self, r):
         product = r["shopify_title"] + (f"  —  {r['variant']}" if r["variant"] else "")
         amt = "" if r["diff_amt"] is None else ("+" if r["diff_amt"] > 0 else "−") + money(abs(r["diff_amt"]))
         margin = lambda m: "" if m is None else f"{m:.0f}%"
         tcg_margin = margin(r["tcg_margin_pct"]) + ("  ⚠" if r["below_cost"] else "")
         flags = ("★" if r["presale"] else "") + ("⚡" if r["fast_moving"] else "") + ("✎" if r["live_entered"] else "")
+        at = r.get("locations")
+        locs = tuple("" if at is None else at.get(n, 0) for n in self.locations)
         return (r["tag"], flags, product, money(r["our_price"]), money(r["cost"]),
                 margin(r["margin_pct"]), money(r["tcg_price"]), tcg_margin, pct(r["diff_pct"]), amt,
-                r["tcg_name"] or "—", r["match"])
+                money(r.get("suggested_price")), stock_text(r["stock"])) + locs + (r["tcg_name"] or "—", r["match"])
 
     def _matches_filter(self, r, code):
         if code is None:
             return True
+        if code == "need_update":
+            return r["tag"] in NEED_UPDATE
         if code in ("presale", "below_cost", "fast_moving"):
             return r[code]
         return r["tag"] == code
 
+    def _search_soon(self):
+        if self._search_job:
+            self.after_cancel(self._search_job)
+        self._search_job = self.after(250, self.refresh_table)
+
+    def _toggle_zero(self):
+        self.checker.config["settings"]["show_zero_stock"] = bool(self.show_zero.get())
+        self.refresh_table()
+        if not self.busy:
+            self.show_status()
+
     def refresh_table(self, fallback_index=None):
         """Redraw the list. If the selected row is gone, select the row now at fallback_index."""
-        rows = self.checker.rows
+        self._search_job = None
+        if self._fill_job:
+            self.after_cancel(self._fill_job)
+            self._fill_job = None
+        if self.checker.locations() != self.locations:
+            self._setup_columns()
         lowest = self.checker.config["settings"].get("tcg_price_field") == "lowPrice"
-        for cid, heading, *_ in COLUMNS:
+        for cid, heading, *_ in self.columns:
             if cid == "tcg":
                 heading = "TCG lowest" if lowest else "TCG market"
             arrow = (" ▼" if self.sort_reverse else " ▲") if cid == self.sort_key else ""
             self.tree.heading(cid, text=heading + arrow)
-        counts = {label: sum(self._matches_filter(r, code) for r in rows) for label, code in FILTERS}
+        kind = KINDS.get(self.kind.get())
+        show_zero = self.show_zero.get()
+        base = [r for r in self.checker.rows
+                if (show_zero or has_stock(r)) and (kind is None or r.get("kind", "sealed") == kind)]
+        # one pass for the counts on the filter buttons
+        counts = dict.fromkeys((label for label, _ in FILTERS), 0)
+        counts["All"] = len(base)
+        by_code = {code: label for label, code in FILTERS if code}
+        for r in base:
+            label = by_code.get(r["tag"])
+            if label:
+                counts[label] += 1
+            if r["tag"] in NEED_UPDATE:
+                counts["Need update"] += 1
+            for flag in ("presale", "below_cost", "fast_moving"):
+                if r[flag]:
+                    counts[by_code[flag]] += 1
         for label, b in self.filter_buttons.items():
-            b.config(text=f"{label} ({counts[label]})" if rows else label)
+            b.config(text=f"{label} ({counts[label]})" if self.checker.rows else label)
+        self.after_idle(self.filter_bar.reflow)  # the counts change the buttons' widths
         code = dict(FILTERS)[self.filter.get()]
         needle = self.search.get().strip().lower()
-        visible = [r for r in rows if self._matches_filter(r, code)
+        visible = [r for r in base if self._matches_filter(r, code)
                    and (not needle or needle in f"{r['shopify_title']} {r['variant']} {r['tcg_name']}".lower())]
         if self.sort_key:
-            key = next(c[4] for c in COLUMNS if c[0] == self.sort_key)
+            key = next(c[4] for c in self.columns if c[0] == self.sort_key)
             visible.sort(key=key, reverse=self.sort_reverse)
         selected = self._selected()
+        want = (selected["shopify_title"], selected["variant"]) if selected else None
         self.tree.delete(*self.tree.get_children())
         self.visible = visible
-        for i, r in enumerate(visible):
-            self.tree.insert("", "end", iid=str(i), values=self._row_text(r), tags=(r["tag"],))
-            if selected and (r["shopify_title"], r["variant"]) == (selected["shopify_title"], selected["variant"]):
-                self.tree.selection_set(str(i))
-                self.tree.see(str(i))
-        if not self.tree.selection() and fallback_index is not None and visible:
+        found = None
+        if want:
+            found = next((i for i, r in enumerate(visible) if (r["shopify_title"], r["variant"]) == want), None)
+        first = max(FIRST_BATCH, (found or 0) + 50)
+        self._insert_rows(0, min(first, len(visible)))
+        if found is not None:
+            self.tree.selection_set(str(found))
+            self.tree.see(str(found))
+        elif fallback_index is not None and visible:
             i = str(min(fallback_index, len(visible) - 1))
             self.tree.selection_set(i)
             self.tree.see(i)
+        if len(visible) > first:
+            self._fill_job = self.after(1, self._fill_more, first)
         self._update_detail()
+
+    def _insert_rows(self, start, end):
+        insert, text = self.tree.insert, self._row_text
+        for i in range(start, end):
+            r = self.visible[i]
+            insert("", "end", iid=str(i), values=text(r), tags=(r["tag"],))
+
+    def _fill_more(self, start):
+        """Add the rest of a long list a batch at a time, between other window events."""
+        end = min(start + BATCH, len(self.visible))
+        self._insert_rows(start, end)
+        self._fill_job = self.after(1, self._fill_more, end) if end < len(self.visible) else None
 
     def sort_by(self, cid):
         self.sort_reverse = (not self.sort_reverse if self.sort_key == cid
@@ -1732,8 +2708,21 @@ class App(tk.Tk):
             self._size_detail()
             return
         parts = [f"{r['shopify_title']}{' — ' + r['variant'] if r['variant'] else ''}  ({r['channel']}, {r['type']})"]
+        at = r.get("locations")
+        stock = f"Stock {stock_text(r['stock']) or '—'}"
+        if at is not None:
+            stock += "  ·  " + "  ·  ".join(f"{n}: {at.get(n, 0)}" for n in self.locations)
+        parts.append(stock)
+        if r.get("suggested_price"):
+            parts.append(f"Suggested new price: {money(r['suggested_price'])} (TCGplayer"
+                         + (f", {CONDITIONS.get(r['condition'], r['condition'])}" if r.get("condition") else "") + ")")
+        if r.get("tag") == "NO PRICE SOURCE":
+            parts.append("TCGplayer doesn't price this kind of product (sports cards, graded slabs, accessories, "
+                         "merchandise...), so it isn't compared.")
         if r["tcg_name"]:
-            parts.append(f"TCGplayer: {r['tcg_name']}  ·  set: {r['tcg_set']}  ·  match: {r['match']}")
+            parts.append(f"TCGplayer: {r['tcg_name']}  ·  set: {r['tcg_set']}  ·  match: {r['match']}"
+                         + (f"  ·  {r['finish']}" if r.get("finish") else "")
+                         + (f"  ·  condition {CONDITIONS.get(r['condition'], r['condition'])}" if r.get("condition") else ""))
             parts.append(f"Compared against: {r['source'] or 'no TCGplayer price'}"
                          + (f"  ·  cheapest listing at snapshot time {money(r['tcg_low'])}" if r["tcg_low"] is not None else ""))
         if r["live_entered"]:
@@ -1873,7 +2862,7 @@ class App(tk.Tk):
         if not path:
             return
         try:
-            write_csv(self.visible, path)
+            write_csv(self.visible, path, self.locations)
         except OSError as e:
             messagebox.showerror("Export", f"Couldn't save the file:\n{e}", parent=self)
             return
@@ -1899,7 +2888,8 @@ class MatchPicker(tk.Toplevel):
     def __init__(self, app, row):
         super().__init__(app)
         self.app, self.row = app, row
-        self.title("Choose the TCGplayer product")
+        self.single = row.get("kind") == "single"
+        self.title("Choose the TCGplayer card" if self.single else "Choose the TCGplayer product")
         fit_window(self, 1100, 620, 0.8, 0.75)
         self.transient(app)
         ttk.Label(self, text=row["shopify_title"] + (f" — {row['variant']}" if row["variant"] else ""),
@@ -1908,7 +2898,9 @@ class MatchPicker(tk.Toplevel):
                   "average price.", padding=(12, 0, 12, 6), foreground=app.colors["muted"]).pack(fill="x")
         bar = ttk.Frame(self, padding=(12, 0))
         bar.pack(fill="x")
-        self.query = tk.StringVar(value=SHOPIFY_NOISE.sub(" ", f"{row['shopify_title']} {row['variant']}").strip())
+        start = (row["shopify_title"] if self.single
+                 else SHOPIFY_NOISE.sub(" ", f"{row['shopify_title']} {row['variant']}").strip())
+        self.query = tk.StringVar(value=start)
         entry = ttk.Entry(bar, textvariable=self.query)
         entry.pack(side="left", fill="x", expand=True)
         entry.bind("<Return>", lambda e: self.search())
@@ -1942,7 +2934,7 @@ class MatchPicker(tk.Toplevel):
         self.config(cursor="watch")
         self.update_idletasks()
         try:
-            self.results = self.app.checker.search_tcg(self.query.get())
+            self.results = self.app.checker.search_tcg(self.query.get(), single=self.single)
         finally:
             self.config(cursor="")
         self.tree.delete(*self.tree.get_children())
@@ -2082,7 +3074,7 @@ class Settings(tk.Toplevel):
 
         ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=10)
         r += 1
-        ttk.Label(f, text="Shopify product types to check (singles are never checked):").grid(row=r, column=0, columnspan=3, sticky="w")
+        ttk.Label(f, text="Sealed product types (matched to TCGplayer sealed products):").grid(row=r, column=0, columnspan=3, sticky="w")
         r += 1
         types_frame = ttk.Frame(f)
         types_frame.grid(row=r, column=0, columnspan=3, sticky="w")
@@ -2096,6 +3088,22 @@ class Settings(tk.Toplevel):
         r += 1
         self.drafts = tk.BooleanVar(value=s.get("include_drafts", False))
         ttk.Checkbutton(f, text="Also check draft (not published) products", variable=self.drafts).grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        r += 1
+        self.singles = tk.BooleanVar(value=s.get("check_singles", True))
+        ttk.Checkbutton(f, text="Price-check TCG singles too (MTG, Pokemon, One Piece... by their Shopify tags)",
+                        variable=self.singles).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        ttk.Label(f, text="Singles: % of TCGplayer's Near Mint price for each condition:").grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        r += 1
+        cond = ttk.Frame(f)
+        cond.grid(row=r, column=0, columnspan=3, sticky="w")
+        self.cond_vars = {}
+        for i, code in enumerate(CONDITIONS):
+            ttk.Label(cond, text=code, foreground=app.colors["muted"]).grid(row=0, column=2 * i, sticky="e", padx=(0 if i == 0 else 12, 4))
+            v = tk.StringVar(value=f"{float(s['condition_pct'].get(code, 100)):g}")
+            ttk.Spinbox(cond, from_=0, to=200, increment=5, textvariable=v, width=5).grid(row=0, column=2 * i + 1)
+            self.cond_vars[code] = v
         r += 1
 
         ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=10)
@@ -2130,9 +3138,11 @@ class Settings(tk.Toplevel):
             for key in ("drift_pct", "urgent_pct", "presale_drift_pct", "presale_urgent_pct"):
                 s[key] = float(self.vars[key].get())
             s["new_release_days"] = int(float(self.vars["new_release_days"].get()))
+            s["condition_pct"] = {code: float(v.get()) for code, v in self.cond_vars.items()}
         except ValueError:
             messagebox.showerror("Settings", "The percentages must be numbers.", parent=self)
             return
+        s["check_singles"] = self.singles.get()
         if self.text_size.get() in TEXT_SIZES:
             s["text_size"] = TEXT_SIZES[self.text_size.get()]
         s["tcg_price_field"] = self.field.get()
@@ -2161,22 +3171,46 @@ def cli_main(argv):
                     help="config.yaml with a shopify: section (default: the file chosen in the window)")
     ap.add_argument("--shopify-csv", type=Path, help="Shopify product export instead of the API")
     ap.add_argument("--out", default=HERE / "reports", type=Path)
+    ap.add_argument("--show-zero", action="store_true", help="include out-of-stock listings in the reports")
+    ap.add_argument("--no-singles", action="store_true", help="don't price-check singles this run")
+    ap.add_argument("--cached-shopify", action="store_true",
+                    help="reuse the Shopify products saved by the last check instead of reading Shopify")
+    ap.add_argument("--no-bulk", action="store_true", help="page through Shopify instead of one bulk operation")
+    ap.add_argument("--timings", action="store_true", help="print how long each step took")
     args = ap.parse_args(argv)
     if sys.stdout:  # (a packaged windowed app has no console)
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows consoles default to cp1252
 
     checker = PriceChecker(args.config, args.credentials, args.out)
+    kept = {k: checker.config["settings"][k] for k in ("check_singles", "shopify_bulk")}
+    if args.no_singles:
+        checker.config["settings"]["check_singles"] = False
+    if args.no_bulk:
+        checker.config["settings"]["shopify_bulk"] = False
+    started = time.perf_counter()
     try:
-        rows = checker.run(progress=print, shopify_csv=args.shopify_csv)
+        rows = checker.run(progress=print, shopify_csv=args.shopify_csv, use_cache=args.cached_shopify)
     except SetupError as e:
         sys.exit(str(e))
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, ssl.SSLError) as e:
         sys.exit(friendly_error(e, checker.stage))  # network / HTTP trouble: plain words, not a traceback
+    checker.config["settings"].update(kept)  # one-off flags aren't saved in products.json
     checker.save()
-    html_path, csv_path = checker.write_reports()
-    counts = {t: sum(r["tag"] == t for r in rows) for t in TAG_ORDER}
+    clock = time.perf_counter()
+    html_path, csv_path = checker.write_reports(show_zero=args.show_zero or None)
+    checker.timings["reports"] = time.perf_counter() - clock
+    shown = rows if args.show_zero or checker.config["settings"].get("show_zero_stock") else [r for r in rows if has_stock(r)]
+    counts = {t: sum(r["tag"] == t for r in shown) for t in TAG_ORDER}
     print("\n" + " · ".join(f"{t.title()}: {n}" for t, n in counts.items() if n))
-    print(f"Report: {html_path}\nCSV:    {csv_path}")
+    if len(shown) < len(rows):
+        print(f"{len(rows) - len(shown)} out-of-stock listings left out of the reports (--show-zero includes them)")
+    for note in checker.notes:
+        print(f"Note: {note}")
+    print(f"Report: {html_path}\nCSV:    {csv_path}\nNeed update: {html_path.with_name(html_path.name.replace('price_report_', 'need_update_')).with_suffix('.csv')}")
+    if args.timings:
+        checker.timings["total"] = time.perf_counter() - started
+        print("Timings: " + " · ".join(f"{k} {v:.2f}s" if isinstance(v, float) else f"{k} {v}"
+                                       for k, v in checker.timings.items()))
 
 
 # ================================================================ app icon (drawn in code: no image files needed)
