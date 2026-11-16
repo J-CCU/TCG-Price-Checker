@@ -723,7 +723,8 @@ def is_tracked(item, settings):
     """Sealed product we sell: right product type, active (unless drafts wanted), not on the ignore list."""
     if item.get("type", "").lower() not in {t.lower() for t in settings["sealed_types"]}:
         return False
-    if not settings.get("include_drafts") and item.get("status", "").upper() not in ("ACTIVE", ""):
+    allowed = ("ACTIVE", "", "DRAFT") if settings.get("include_drafts") else ("ACTIVE", "")
+    if item.get("status", "").upper() not in allowed:
         return False
     return not has_any_word(item["title"], settings.get("ignore_words", []))
 
@@ -2169,6 +2170,8 @@ def cli_main(argv):
         rows = checker.run(progress=print, shopify_csv=args.shopify_csv)
     except SetupError as e:
         sys.exit(str(e))
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, ssl.SSLError) as e:
+        sys.exit(friendly_error(e, checker.stage))  # network / HTTP trouble: plain words, not a traceback
     checker.save()
     html_path, csv_path = checker.write_reports()
     counts = {t: sum(r["tag"] == t for r in rows) for t in TAG_ORDER}
@@ -2245,26 +2248,28 @@ def build_app():
     script = Path(__file__).resolve()
     work = Path(tempfile.mkdtemp(prefix="tcg_build_"))
     print(f"Building {name} in {work} ... (takes a few minutes the first time)")
-    venv.create(work / "venv", with_pip=True)
-    py = work / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-    subprocess.run([str(py), "-m", "pip", "install", "--quiet", "pyinstaller", "pillow"], check=True)
-    icon = work / ("icon.ico" if sys.platform == "win32" else "icon.png")
-    write_icon(icon)
-    args = [str(py), "-m", "PyInstaller", "--noconfirm", "--windowed", "--name", name, "--icon", str(icon),
-            "--distpath", str(work / "dist"), "--workpath", str(work / "build"), "--specpath", str(work)]
-    if sys.platform == "darwin":
-        args += ["--osx-bundle-identifier", "com.tcgpricechecker.app"]
-    else:
-        args += ["--onefile"]
-    subprocess.run(args + [str(script)], check=True)
-    built = work / "dist" / (f"{name}.app" if sys.platform == "darwin" else f"{name}.exe")
-    target = script.parent / built.name
-    if target.is_dir():
-        shutil.rmtree(target)
-    elif target.exists():
-        target.unlink()
-    shutil.move(str(built), str(target))
-    shutil.rmtree(work, ignore_errors=True)
+    try:
+        venv.create(work / "venv", with_pip=True)
+        py = work / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+        subprocess.run([str(py), "-m", "pip", "install", "--quiet", "pyinstaller", "pillow"], check=True)
+        icon = work / ("icon.ico" if sys.platform == "win32" else "icon.png")
+        write_icon(icon)
+        args = [str(py), "-m", "PyInstaller", "--noconfirm", "--windowed", "--name", name, "--icon", str(icon),
+                "--distpath", str(work / "dist"), "--workpath", str(work / "build"), "--specpath", str(work)]
+        if sys.platform == "darwin":
+            args += ["--osx-bundle-identifier", "com.tcgpricechecker.app"]
+        else:
+            args += ["--onefile"]
+        subprocess.run(args + [str(script)], check=True)
+        built = work / "dist" / (f"{name}.app" if sys.platform == "darwin" else f"{name}.exe")
+        target = script.parent / built.name
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+        shutil.move(str(built), str(target))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     print(f"\nDone: {target}\nMove it anywhere. Its saved choices, cache and reports stay in the folder next to it.")
 
 

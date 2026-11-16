@@ -169,7 +169,7 @@ Top-level keys:
 | `presale_urgent_pct` | `10` | Urgent threshold for presale items. |
 | `tcg_price_field` | `marketPrice` | `marketPrice` (Market Price) or `lowPrice` (lowest listing). |
 | `sealed_types` | `Box`, `Pack`, `Tin` | Shopify product types to check. |
-| `include_drafts` | `false` | Also check products that are not active (drafts, and also archived products). |
+| `include_drafts` | `false` | Also check draft products. Archived products are never checked. |
 | `ignore_words` | sports-card brands etc. | Skip products whose title contains any of these (whole words). |
 | `self_priced_words` | `damaged` | Treat as SELF-PRICED when the title contains any of these. |
 | `new_release_days` | `30` | Sets released within this many days are flagged fast-moving. |
