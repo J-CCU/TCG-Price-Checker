@@ -13,9 +13,12 @@ The app never cancels a bulk operation; if Shopify won't start one, the app read
 
 ## Quick start
 
+Prebuilt apps aren't included right now; build one from source (see [Building the app](#building-the-app))
+or run the script with Python.
+
 1. Get a `config.yaml` with your store's Shopify login (see [config.yaml](#configyaml-shopify-login)).
-2. Open `TCG Price Checker.exe` (Windows) or `TCG Price Checker.app` (Mac), or run
-   `python3 tcg_price_checker.py` (see [How to run](#how-to-run)).
+2. Run `python3 tcg_price_checker.py` (see [How to run](#how-to-run)), or open a `TCG Price Checker.exe`
+   (Windows) or `TCG Price Checker.app` (Mac) you built yourself (see [Building the app](#building-the-app)).
 3. When asked, choose your `config.yaml`. The first check starts automatically.
 4. Click "Need update" to see every URGENT and DRIFTING row with its suggested new price ("Set to"), and
    check the CHECK MATCH rows. "Open printable report" opens the HTML report (share it with the store
@@ -93,10 +96,8 @@ card and finish for that exact title and variant (condition).
 
 ## Requirements
 
-- Prebuilt app: nothing to install.
-  - Windows: `TCG Price Checker.exe`
-  - Mac: unzip `TCG Price Checker.app.zip` to get `TCG Price Checker.app`. The included build is for
-    Apple Silicon Macs; on an Intel Mac, run from source or build it yourself (see [Building the app](#building-the-app)).
+- Built app: nothing to install to run it. Build it yourself (see [Building the app](#building-the-app)); a
+  Mac build runs only on Macs with the same chip type as the one that built it.
 - From source: Python 3.10 or newer with Tkinter (included with the python.org installers). Only the
   standard library is needed. PyYAML is used to read `config.yaml` if installed, but is optional; without
   it, a built-in reader handles simple `key: "value"` lines.
@@ -106,9 +107,9 @@ card and finish for that exact title and variant (condition).
 
 ## How to run
 
-### Prebuilt app
+### Built app
 
-1. Put the app in its own folder. Its data (`products.json`, `cache/`, `reports/`) is created next to it,
+1. Build the app (see [Building the app](#building-the-app)) and put it in its own folder. Its data (`products.json`, `cache/`, `reports/`) is created next to it,
    so moving the folder moves everything.
 2. Open it:
    - Windows: double-click `TCG Price Checker.exe`.
@@ -344,7 +345,7 @@ draws the app icon in code, and runs PyInstaller (`--windowed`; `--onefile` on W
 `com.tcgpricechecker.app` on Mac). The finished app is placed next to the script and the temp folder is
 removed. A Mac app only runs on Macs with the same chip type as the one that built it.
 
-To ship the Mac app, zip `TCG Price Checker.app` (as in `TCG Price Checker.app.zip`).
+To ship the Mac app, zip `TCG Price Checker.app`.
 
 ## Speed
 
@@ -388,7 +389,7 @@ main thread.
 | A product is matched to the wrong TCGplayer item | Select it > Choose a different match..., or Hide this product. |
 | A product is missing from the list | Check it has stock (or tick "Show out of stock"), it is active (or drafts are included), and it was not hidden (see Saved choices). |
 | A product deleted in Shopify still appears | Later checks in a day only fetch changed products. It drops out at the first check of the next day, or delete `cache/shopify_products.json` and check again. |
-| Mac says the app cannot be opened | Right-click > Open > Open the first time. On an Intel Mac, the included Apple Silicon build will not run; build your own. |
+| Mac says the app cannot be opened | Right-click > Open > Open the first time. A Mac build only runs on the chip type it was built on; build your own on that Mac. |
 | Settings or choices lost after an edit | A damaged `products.json` is renamed to `products.damaged.json` and `products.json.bak` is used. |
 | Any other error in the window | Details are in `error_log.txt` in the data folder. |
 
@@ -397,8 +398,6 @@ main thread.
 | Path | Notes |
 | --- | --- |
 | `tcg_price_checker.py` | The whole app: matching (sealed and singles), Shopify and tcgcsv access, window, reports, build. |
-| `TCG Price Checker.exe` | Prebuilt Windows app. |
-| `TCG Price Checker.app.zip` | Prebuilt Mac app (zipped). |
 | `products.json`, `products.json.bak` | Saved choices and settings (created at runtime, not in the repo). |
 | `cache/`, `reports/`, `error_log.txt` | Created at runtime. |
 | `config.yaml` | Your Shopify login file. Keep it out of git; it can live anywhere. |
