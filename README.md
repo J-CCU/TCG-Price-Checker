@@ -1,11 +1,21 @@
 # TCG Price Checker
 
-A desktop app that compares every sealed product (boxes, packs, tins, and so on) in a Shopify store with
-TCGplayer prices, and flags listings whose price has drifted away from the market.
+A desktop app for Shopify stores that sell sealed trading card product. It compares every sealed listing
+(boxes, packs, tins, and so on) with TCGplayer prices and flags listings whose price has drifted away from
+the market.
 
 TCGplayer prices come from [tcgcsv.com](https://tcgcsv.com), which republishes TCGplayer's catalogue and
 prices once a day. The app is read-only: it only reads from Shopify and tcgcsv and never changes anything
 in the store.
+
+## Quick start
+
+1. Get a `config.yaml` with your store's Shopify login (see [config.yaml](#configyaml-shopify-login)).
+2. Open `TCG Price Checker.exe` (Windows) or `TCG Price Checker.app` (Mac), or run
+   `python3 tcg_price_checker.py` (see [How to run](#how-to-run)).
+3. When asked, choose your `config.yaml`. The first check starts automatically.
+4. Work through the URGENT and CHECK MATCH rows. "Open printable report" opens the HTML report; the same
+   rows are in `reports/price_report_<date>.csv`.
 
 ## Features
 
@@ -16,7 +26,11 @@ in the store.
 - Status for each listing:
   - `URGENT` / `DRIFTING`: our price is at least the set percentage away from TCGplayer
   - `CHECK MATCH`: the automatic match is uncertain (or the price gap is suspiciously large), please confirm
-  - `OK`, `SELF-PRICED` (we price it ourselves), `NO PRICE`, `NO MATCH`, `NO DATA`
+  - `OK`: within the drifting threshold
+  - `SELF-PRICED`: marked "we price this ourselves", or the title contains a self-priced word
+  - `NO PRICE`: matched, but TCGplayer has no price for it
+  - `NO MATCH`: no TCGplayer product found (shown under the "Not on TCGplayer" filter)
+  - `NO DATA`: the Shopify listing has no price
 - Flags: presale, fast-moving (presale or set released recently), TCGplayer price below our cost.
 - Cost and margin from Shopify's "Cost per item": our margin, and the margin if priced at TCGplayer.
 - Separate drift / urgent thresholds for presale items.
@@ -33,11 +47,13 @@ in the store.
 
 - Prebuilt app: nothing to install.
   - Windows: `TCG Price Checker.exe`
-  - Mac: unzip `TCG Price Checker.app.zip` to get `TCG Price Checker.app`
+  - Mac: unzip `TCG Price Checker.app.zip` to get `TCG Price Checker.app`. The included build is for
+    Apple Silicon Macs; on an Intel Mac, run from source or build it yourself (see [Building the app](#building-the-app)).
 - From source: Python 3.10 or newer with Tkinter (included with the python.org installers). Only the
-  standard library is needed. PyYAML is used to read `config.yaml` if installed, but is optional.
+  standard library is needed. PyYAML is used to read `config.yaml` if installed, but is optional; without
+  it, a built-in reader handles simple `key: "value"` lines.
 - Internet access to `tcgcsv.com` and the store's `*.myshopify.com` domain.
-- A `config.yaml` with a `shopify:` section (see Configuration), or a Shopify product export CSV for
+- A `config.yaml` with a `shopify:` section (see [Configuration](#configuration)), or a Shopify product export CSV for
   command-line runs.
 
 ## How to run
@@ -75,7 +91,7 @@ python3 tcg_price_checker.py --cli [--credentials PATH] [--shopify-csv EXPORT.cs
 | `--shopify-csv PATH` | | Read a Shopify product export CSV instead of calling the Shopify API. |
 | `--config PATH` | `products.json` in the data folder | Saved choices and settings file. |
 | `--out DIR` | `reports/` in the data folder | Where reports are written. |
-| `--build-app` | | Build the stand-alone app (see Building the app). |
+| `--build-app` | | Build the stand-alone app (see [Building the app](#building-the-app)). |
 
 ## Using the window
 
@@ -153,7 +169,7 @@ Top-level keys:
 | `presale_urgent_pct` | `10` | Urgent threshold for presale items. |
 | `tcg_price_field` | `marketPrice` | `marketPrice` (Market Price) or `lowPrice` (lowest listing). |
 | `sealed_types` | `Box`, `Pack`, `Tin` | Shopify product types to check. |
-| `include_drafts` | `false` | Also check draft products. |
+| `include_drafts` | `false` | Also check products that are not active (drafts, and also archived products). |
 | `ignore_words` | sports-card brands etc. | Skip products whose title contains any of these (whole words). |
 | `self_priced_words` | `damaged` | Treat as SELF-PRICED when the title contains any of these. |
 | `new_release_days` | `30` | Sets released within this many days are flagged fast-moving. |
@@ -168,7 +184,7 @@ Edit `products.json` only while the app is closed.
 
 ## Outputs
 
-All in the data folder (see Data folder location).
+All in the data folder (see [Data folder location](#data-folder-location)).
 
 ### reports/
 
@@ -244,16 +260,19 @@ To ship the Mac app, zip `TCG Price Checker.app` (as in `TCG Price Checker.app.z
 | Message / symptom | Fix |
 | --- | --- |
 | "No Shopify login file chosen yet" / "can't be found" | Open Settings > Choose file... and pick your `config.yaml`. |
-| "has no filled-in 'shopify:' section" / "needs a store_url" / "needs client_id and client_secret" | Fill in the `shopify:` section (see Configuration). |
+| "has no filled-in 'shopify:' section" / "needs a store_url" / "needs client_id and client_secret" | Fill in the `shopify:` section (see [Configuration](#configuration)). |
 | "Shopify didn't accept the login" | Check the credentials and that the Shopify app is installed on the store with permission to read products. |
+| "Shopify login failed: ..." | The `client_id` / `client_secret` exchange failed. Check both values, or add an `admin_api_token`. |
+| "Shopify API error: ..." | Shopify rejected the product query; the message names the cause, often a missing permission. |
 | Cost and margin columns are blank | The Shopify app lacks inventory read access, or "Cost per item" is not filled in. |
 | "A secure connection couldn't be checked" (Mac) | Run "Install Certificates.command" from Applications > Python 3.x. |
 | "Couldn't connect to ..." | Check the internet connection, then Check prices now. |
-| "... says it's busy" / error 5xx | Wait a few minutes and try again. |
+| "... says it's busy right now" / "... is having problems right now (error 5xx)" | Wait a few minutes and try again. |
 | Status bar time shown as a warning | The TCGplayer snapshot is over 30 hours old; tcgcsv may not have updated yet. |
 | A product is matched to the wrong TCGplayer item | Select it > Choose a different match..., or Hide this product. |
-| A product is missing from the list | Check its product type is ticked in Settings, it is active (or drafts are included), and its title has no ignore word. |
-| Mac says the app cannot be opened | Right-click > Open > Open the first time. |
+| A product is missing from the list | Check its product type is ticked in Settings, it is active (or drafts are included), its title has no ignore word, and it was not hidden (see Saved choices). |
+| A product deleted in Shopify still appears | Later checks in a day only fetch changed products. It drops out at the first check of the next day, or delete `cache/shopify_products.json` and check again. |
+| Mac says the app cannot be opened | Right-click > Open > Open the first time. On an Intel Mac, the included Apple Silicon build will not run; build your own. |
 | Settings or choices lost after an edit | A damaged `products.json` is renamed to `products.damaged.json` and `products.json.bak` is used. |
 | Any other error in the window | Details are in `error_log.txt` in the data folder. |
 
