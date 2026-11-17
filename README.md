@@ -6,10 +6,11 @@ One Piece and other games) with TCGplayer prices, and flags listings whose price
 market, with a suggested new price.
 
 TCGplayer prices come from [tcgcsv.com](https://tcgcsv.com), which republishes TCGplayer's catalogue and
-prices once a day. The app is read-only: it only reads from Shopify and tcgcsv and never changes anything
-in the store. (Full Shopify reads use a bulk operation, `bulkOperationRunQuery`. Shopify files it under
-mutations, but it only runs a read query and builds a file of the results to download; it changes nothing.
-The app never cancels a bulk operation; if Shopify won't start one, the app reads page by page instead.)
+prices once a day. The app only reads from Shopify and tcgcsv, with one exception: "Update Shopify
+prices..." changes the prices of listings you select, and only after you check each new price and confirm.
+Every change is logged in `reports/price_changes.csv`. (Full Shopify reads use a bulk operation,
+`bulkOperationRunQuery`. Shopify files it under mutations, but it only runs a read query and builds a file
+of the results to download; it changes nothing. The app never cancels a bulk operation; if Shopify won't start one, the app reads page by page instead.)
 
 ## Quick start
 
@@ -20,9 +21,9 @@ or run the script with Python.
 2. Run `python3 tcg_price_checker.py` (see [How to run](#how-to-run)), or open a `TCG Price Checker.exe`
    (Windows) or `TCG Price Checker.app` (Mac) you built yourself (see [Building the app](#building-the-app)).
 3. When asked, choose your `config.yaml`. The first check starts automatically.
-4. Click "Need update" to see every URGENT and DRIFTING row with its suggested new price ("Set to"), and
+4. Click "Need update" to see every URGENT and DRIFTING row (the suggested new price is in the details under the table), and
    check the CHECK MATCH rows. "Open printable report" opens the HTML report (share it with the store
-   managers: it shows every location's stock); the same rows are in `reports/price_report_<date>.csv` and
+   managers: it shows every store's stock); the same rows are in `reports/price_report_<date>.csv` and
    the rows that need a new price in `reports/need_update_<date>.csv`.
 
 ## Features
@@ -50,8 +51,14 @@ or run the script with Python.
   - `NO DATA`: the Shopify listing has no price
 - "Need update": every URGENT and DRIFTING row, with the suggested new price (the TCGplayer price; for
   singles adjusted for condition). In the window, the HTML report, and `need_update_<date>.csv`.
-- Stock: total available quantity, plus one column per Shopify location, in the window and the reports,
-  so every store can see what the others hold.
+- Stock: one column per store / warehouse plus their total, in the window and the reports, so every store
+  can see what the others hold. Columns are set in Settings (`stock_columns`): by default Warehouse (Cash
+  Cards Unlimited Warehouse + Relics Awakened), Frank and Son, Janss and Woodland Hills. Shopify locations
+  in no column (e.g. Spoils and Loot via Shopify Collective) aren't counted; a listing stocked only there
+  counts as out of stock. The details under the table show any stock that isn't counted.
+- Update Shopify prices: select one or more rows, check or type each new price (it starts at the
+  suggested price), then send them to Shopify after a confirmation that lists every change.
+- Columns can be dragged to a new place; the order is remembered. Right-click a heading to reset it.
 - Out-of-stock listings (stock 0 or blank) are hidden by default in the window and the reports; "Show out
   of stock" (or `--show-zero`) brings them back. The report says how many were left out.
 - Flags: presale, fast-moving (presale or set released recently), TCGplayer price below our cost.
@@ -154,7 +161,7 @@ python3 tcg_price_checker.py --cli [--credentials PATH] [--shopify-csv EXPORT.cs
 | Check prices now | Re-read Shopify and tcgcsv and recompute (also Cmd/Ctrl+R or F5). |
 | Open printable report | Write and open the HTML report in your browser. |
 | Saved choices | List every saved match / choice; remove one to undo it. |
-| Settings | Thresholds, comparison price, product types, word lists, login file, text size. |
+| Settings | Thresholds, comparison price, product types, word lists, stock columns, login file, text size. |
 | Export this list... | Save the rows currently shown (current filter, kind, stock toggle and search) as CSV, with every location's stock. Choose "Need update" first to export just the rows whose price should change. |
 | Help | Explains statuses, symbols and shortcuts. |
 | Filter buttons | All, Need update (Urgent + Drifting), Urgent, Drifting, Check match, OK, Presale, Fast-moving, Below cost, We price, Not on TCGplayer, No price, No price source, No data. Each shows its count. |
@@ -162,14 +169,30 @@ python3 tcg_price_checker.py --cli [--credentials PATH] [--shopify-csv EXPORT.cs
 | Show out of stock | Off by default: listings with stock 0 or blank are hidden. The status line says how many. |
 
 Table columns: Status, Flags, Shopify product (title and variant), Our price, Cost, Our margin, TCG market
-(or TCG lowest), Margin at TCG, Difference, $ diff, Set to (suggested new price, Need update rows only),
-Stock (total available), one column per Shopify location (short names; full names are in the details
-under the table), TCGplayer product, Match. On a narrow window the less important columns hide first
+(or TCG lowest), Margin at TCG, Difference, $ diff, Stock (total of the stock columns), one column per
+stock column (see `stock_columns`), TCGplayer product, Match. Drag a heading to move a column; right-click
+a heading for "Reset column order". The order is saved when the window closes. On a narrow window the less important columns hide first
 (Match, Margin at TCG, Our margin, $ diff, Cost, Flags, then the location columns); the details under the
-table always show everything, including each location's stock by full name.
+table always show everything, including the suggested new price and each stock column.
 
 Long lists are drawn in batches so the window stays usable, and the search waits for a pause in typing.
-| Row actions (buttons or right-click) | Open on TCGplayer, Match is correct, Choose a different match..., Enter live price..., We price this ourselves, Hide this product, Undo my choice. |
+| Row actions (buttons or right-click) | Open on TCGplayer, Match is correct, Choose a different match..., Enter live price..., Update Shopify prices..., We price this ourselves, Hide this product, Undo my choice. |
+
+Select several rows with Cmd/Ctrl+click or Shift+click. The other actions use the last row clicked.
+
+### Updating prices in Shopify
+
+1. Select the rows to change (for example in "Need update"), then click "Update Shopify prices...".
+2. Each listing starts at its suggested price (else the TCGplayer price). Type a different price, or
+   "Keep our prices" / "Use suggested prices" for all. The Change column shows the % change, and warns when
+   a price is below cost or 50%+ away. Rows left at our price are skipped.
+3. "Send to Shopify..." shows the full list of changes and asks again before anything is sent. The price
+   changes everywhere the listing is sold (online and POS).
+4. The list updates straight away. Every attempt, changed or failed, is added to
+   `reports/price_changes.csv` (time, product, variant ID, old and new price, result).
+
+This needs the Shopify app to have the `write_products` permission. Rows from a Shopify CSV export
+(`--shopify-csv`) can't be updated.
 
 Double-click a row (or press Enter) to open it on TCGplayer. Symbols: star = presale, lightning =
 fast-moving, warning sign = TCGplayer price below our cost, pencil = price typed in with "Enter live
@@ -246,6 +269,7 @@ Top-level keys:
 | `condition_pct` | `NM 100`, `LP 85`, `MP 70`, `HP 55`, `DMG 40` | % of TCGplayer's Near Mint price a single in that condition should sell for. |
 | `singles_tags` | `MTG Singles`, `Pokemon Singles`, `One Piece Singles`, ... | Shopify tag -> tcgcsv category id (game) for singles (file only). |
 | `no_price_source_tags` | `Sports Singles`, `baseball`, `football`, ... | Listings with any of these tags are NO PRICE SOURCE (file only). |
+| `stock_columns` | Warehouse, Frank and Son, Janss, Woodland Hills | Stock columns in order: `name` and the Shopify `locations` it adds up. Locations in no column aren't counted. Empty list: one column per Shopify location. |
 | `show_zero_stock` | `false` | Show out-of-stock listings in the window and reports ("Show out of stock"). |
 | `shopify_bulk` | `true` | Read every Shopify product with one bulk operation; `false` pages through instead (file only). |
 | `include_drafts` | `false` | Also check draft products. Archived products are never checked. |
@@ -257,7 +281,7 @@ Top-level keys:
 | `auto_match_max_diff_pct` | `75` | An automatic match this far from our price becomes CHECK MATCH (file only). |
 | `tcg_categories` | list of tcgcsv category IDs | TCGplayer games to match against (file only). |
 | `credentials_file` | | Path to the chosen `config.yaml`. |
-| `text_size`, `window` | | Text size and window position, filter and sort. |
+| `text_size`, `window` | | Text size and window position, filter, sort and column order. |
 
 Edit `products.json` only while the app is closed.
 
@@ -270,7 +294,7 @@ All in the data folder (see [Data folder location](#data-folder-location)).
 - `price_report_YYYY-MM-DD.html`: printable report with summary counts, a search box, filter buttons
   (All, Need update, each status, Sealed, Singles, Presale, below cost, fast-moving) and one row per
   listing (status, product with condition and finish, our price, cost and margin, TCGplayer price, low and
-  margin, difference and suggested new price, total stock, one column per Shopify location, matched
+  margin, difference, total stock, one column per stock column, matched
   TCGplayer product with link). It notes how many out-of-stock listings were left out. Supports dark mode.
 - `price_report_YYYY-MM-DD.csv`: same rows, UTF-8 with BOM.
 - `need_update_YYYY-MM-DD.csv`: only the URGENT and DRIFTING rows, same columns.
@@ -295,8 +319,11 @@ CSV columns:
 | `tcg_name`, `tcg_set` | Matched TCGplayer product(s) and set(s). |
 | `source`, `price_as_of` | Where the price came from, and its date if older than today's snapshot. |
 | `snapshot_price`, `live_entered` | Snapshot price, and when a live price was typed in. |
-| `fast_moving`, `status`, `stock`, `note` | Fast-moving flag, Shopify status, total available stock, saved note. |
-| `stock: <location>` | Available stock at each Shopify location (one column per location; blank if per-location stock couldn't be read). |
+| `fast_moving`, `status`, `stock`, `note` | Fast-moving flag, Shopify status, total available stock in the stock columns, saved note. |
+| `stock: <column>` | Available stock in each stock column (see `stock_columns`; blank if per-location stock couldn't be read). |
+
+- `price_changes.csv`: every price sent with "Update Shopify prices..." (`when`, `shopify_title`, `variant`,
+  `variant_id`, `old_price`, `new_price`, `result`).
 
 Reports are rewritten after every check (one set per day). Out-of-stock listings are left out unless "Show
 out of stock" is ticked (or `--show-zero` is given). "Export this list..." writes the same columns to a
@@ -378,7 +405,9 @@ main thread.
 | "Shopify API error: ..." | Shopify rejected the product query; the message names the cause, often a missing permission. |
 | Cost and margin columns are blank | The Shopify app lacks inventory read access, or "Cost per item" is not filled in. |
 | "showing total stock only" in the status line | The Shopify app lacks `read_inventory` / `read_locations`; add them to get per-location stock. |
-| A listing is missing | It may be out of stock: tick "Show out of stock". Also check "Show" is "Everything". |
+| A listing is missing | It may be out of stock: tick "Show out of stock". Stock at locations in no stock column doesn't count. Also check "Show" is "Everything". |
+| "Update Shopify prices" fails with a permission message | The Shopify app needs the `write_products` permission. |
+| "Update Shopify prices" says the rows can't be changed | They came from a CSV export or a check by an older version; press Check prices now first. |
 | A single is CHECK MATCH | The card, finish or edition is ambiguous, or it isn't English. Confirm it, or choose the right card. |
 | A single is NO MATCH | The set code or card name isn't on TCGplayer as written (e.g. Chinese cards, stamped promos). Use "Choose a different match...". |
 | A single is NO PRICE SOURCE | Its tags don't name a game in `singles_tags`, or it has a sports / graded tag. |

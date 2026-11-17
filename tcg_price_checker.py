@@ -22,7 +22,8 @@ day reads every Shopify product with one bulk operation; later ones only fetch w
     prices republished once a day.
   * Status: URGENT / DRIFTING = our price is that far from TCGplayer (percentages set in Settings; "Need
     update" shows both, with the suggested new price), CHECK MATCH = please confirm the TCGplayer product,
-    plus cost, margin, presale and fast-moving flags, and stock per Shopify location.
+    plus cost, margin, presale and fast-moving flags, and stock per store / warehouse.
+    "Update Shopify prices…" changes selected prices in Shopify, only after the operator confirms.
   * Choices people make in the window (confirmed matches, hidden products, typed-in live prices, settings)
     are saved in products.json next to this file. cache/ and reports/ are created here too.
   * Shopify login comes from the shopify: section of a config.yaml (store_url + client_id/client_secret,
@@ -142,6 +143,14 @@ DEFAULT_SETTINGS = {
     "show_zero_stock": False,
     # read every Shopify product with one bulk operation (much faster than paging); off = page through
     "shopify_bulk": True,
+    # stock columns, in order: each adds up one or more Shopify locations. Locations not listed are left out
+    # (also from the Stock total). An empty list = one column per Shopify location.
+    "stock_columns": [
+        {"name": "Warehouse", "locations": ["Cash Cards Unlimited Warehouse", "Relics Awakened"]},
+        {"name": "Frank and Son", "locations": ["Frank and Son"]},
+        {"name": "Janss", "locations": ["Janss Marketplace Storefront"]},
+        {"name": "Woodland Hills", "locations": ["Woodland Hills Storefront"]},
+    ],
 }
 
 # Matches already checked by hand; used to start products.json the first time this runs somewhere new.
@@ -1121,6 +1130,42 @@ class ShopifyReader:
             cursor = page["pageInfo"]["endCursor"]
 
 
+PRICE_UPDATE = ("mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) { "
+                "productVariantsBulkUpdate(productId: $productId, variants: $variants) { "
+                "productVariants { id price } userErrors { field message } } }")
+
+
+def push_prices(store, token, changes, progress=None):
+    """Change our prices in Shopify. The only thing in this program that writes to Shopify, and it's only
+    run after a person confirms the list in the window. changes: [(product_id, variant_id, new price)].
+    Returns {variant_id: (True, price) or (False, reason)}. Needs the write_products permission."""
+    progress = progress or (lambda msg: None)
+    reader = ShopifyReader(store, token)
+    by_product = {}
+    for product_id, variant_id, price in changes:
+        by_product.setdefault(product_id, []).append((variant_id, price))
+    results = {}
+    for n, (product_id, variants) in enumerate(by_product.items(), 1):
+        progress(f"Updating Shopify prices: {n} of {len(by_product)} products")
+        data, errors = reader.gql(PRICE_UPDATE, {"productId": product_id, "variants": [
+            {"id": vid, "price": f"{price:.2f}"} for vid, price in variants]})
+        if errors:
+            text = json.dumps(errors)
+            reason = ("the Shopify app isn't allowed to change products (it needs the write_products permission)"
+                      if "access" in text.lower() else f"Shopify error: {text[:200]}")
+            results.update({vid: (False, reason) for vid, _ in variants})
+            continue
+        result = data["productVariantsBulkUpdate"]
+        if result.get("userErrors"):
+            reason = "; ".join(e.get("message", "") for e in result["userErrors"])
+            results.update({vid: (False, reason) for vid, _ in variants})
+            continue
+        saved = {v["id"]: to_float(v["price"]) for v in result.get("productVariants") or []}
+        for vid, price in variants:
+            results[vid] = (True, saved.get(vid, price))
+    return results
+
+
 def shopify_from_api(store, token, progress=None, changed_since=None):
     """Every variant of every product in our shop (or only those changed since a time)."""
     return ShopifyReader(store, token, progress).variants(changed_since)
@@ -1487,6 +1532,27 @@ def has_stock(row):
     return isinstance(s, (int, float)) and s > 0
 
 
+def group_stock(row, columns):
+    """Fill row["locations"] (stock per column) and row["stock"] from the raw per-location stock in
+    row["locations_raw"] and the stock_columns setting. Locations in no column don't count."""
+    raw = row.get("locations_raw")
+    if raw is None or not columns:
+        row["locations"] = None if raw is None else dict(raw)
+        row["stock"] = row.get("stock_all", row.get("stock"))
+        return
+    by_name = {name.lower(): qty for name, qty in raw.items()}
+    row["locations"] = {c["name"]: sum(by_name.get(n.lower(), 0) for n in c.get("locations", ())) for c in columns}
+    row["stock"] = sum(row["locations"].values())
+
+
+def untracked_stock(row, columns):
+    """{location: qty} with stock at Shopify locations that aren't in any stock column."""
+    if not columns:
+        return {}
+    known = {n.lower() for c in columns for n in c.get("locations", ())}
+    return {n: q for n, q in (row.get("locations_raw") or {}).items() if q and n.lower() not in known}
+
+
 def build_rows(config, shopify_items, index, progress=None, tcg_updated="", memo=None, timings=None):
     """One row per listing: every active (and, if wanted, draft) Shopify variant.
     Sealed product and TCG singles are compared with TCGplayer; everything else is NO PRICE SOURCE."""
@@ -1649,7 +1715,11 @@ def build_rows(config, shopify_items, index, progress=None, tcg_updated="", memo
             "status": item["status"],
             "type": item.get("type", ""),
             "stock": item["stock"],
-            "locations": item.get("locations"),
+            "stock_all": item["stock"],
+            "locations_raw": item.get("locations"),
+            "locations": None,  # per stock column, filled in by group_stock below
+            "product_id": item.get("product_id"),
+            "variant_id": item.get("variant_id"),
             "our_price": ours,
             "compare_at": item["compare_at"],
             "cost": cost,
@@ -1685,6 +1755,9 @@ def build_rows(config, shopify_items, index, progress=None, tcg_updated="", memo
         })
     if remember and index.snapshot_date:
         index._remember([], remember)
+    columns = config["settings"].get("stock_columns") or []
+    for r in rows:
+        group_stock(r, columns)
     sort_rows(rows)
     timings["rows"] = time.perf_counter() - clock
     return rows
@@ -1812,9 +1885,14 @@ class PriceChecker:
         for r in self.rows:  # results saved by an older version of the app
             r.setdefault("kind", "sealed")
             r.setdefault("locations", None)
+            if "locations_raw" not in r:  # saved before stock columns: "locations" held the raw locations
+                r["locations_raw"], r["stock_all"] = r["locations"], r.get("stock")
+            r.setdefault("product_id", None)
+            r.setdefault("variant_id", None)
             r.setdefault("suggested_price", None)
             r.setdefault("condition", "")
             r.setdefault("finish", "")
+        self.regroup_stock()
         self.shopify_items = items
         self.index.snapshot = self.tcg_updated
         self.index.snapshot_date = self.tcg_updated[:10]
@@ -1892,11 +1970,66 @@ class PriceChecker:
         return sorted(counts.items(), key=lambda kv: -kv[1])
 
     def locations(self):
-        """Every Shopify location that holds stock of anything listed, in name order."""
+        """The stock columns (from the stock_columns setting), or, when that's empty, every Shopify
+        location that holds stock of anything listed, in name order."""
+        columns = self.config["settings"].get("stock_columns") or []
+        if columns:
+            return [c["name"] for c in columns]
         names = set()
         for r in self.rows:
             names.update(r.get("locations") or ())
         return sorted(names, key=str.lower)
+
+    def shopify_locations(self):
+        """Every Shopify location seen in the last check, in name order (for Settings)."""
+        names = set()
+        for r in self.rows:
+            names.update(r.get("locations_raw") or ())
+        return sorted(names, key=str.lower)
+
+    def regroup_stock(self):
+        """Re-add the stock per column after the stock_columns setting changed (no Shopify read needed)."""
+        columns = self.config["settings"].get("stock_columns") or []
+        for r in self.rows:
+            group_stock(r, columns)
+
+    def push_prices(self, rows_and_prices, progress=print):
+        """Send confirmed new prices to Shopify, log every attempt to reports/price_changes.csv, and update
+        the list. rows_and_prices: [(row, new price)]. Returns (changed rows, [(row, reason)] that failed)."""
+        creds = shopify_credentials(self.credentials_path)
+        if not creds:
+            raise SetupError("No Shopify login found. Choose your config.yaml in Settings first.")
+        self.stage = "shopify"
+        results = push_prices(*creds, [(r["product_id"], r["variant_id"], p) for r, p in rows_and_prices], progress)
+        stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        log = self.out_dir / "price_changes.csv"
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        new = not log.exists()
+        with open(log, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["when", "shopify_title", "variant", "variant_id", "old_price", "new_price", "result"])
+            for r, p in rows_and_prices:
+                ok, info = results.get(r["variant_id"], (False, "not sent"))
+                w.writerow([stamp, r["shopify_title"], r["variant"], r["variant_id"], r["our_price"], f"{p:.2f}",
+                            "changed" if ok else f"failed: {info}"])
+        done = {vid: info for vid, (ok, info) in results.items() if ok}
+        self.apply_price_changes(done)
+        failed = [(r, results.get(r["variant_id"], (False, "not sent"))[1]) for r, _ in rows_and_prices
+                  if not results.get(r["variant_id"], (False,))[0]]
+        return [r for r, _ in rows_and_prices if r["variant_id"] in done], failed
+
+    def apply_price_changes(self, changes):
+        """After prices were changed in Shopify: {variant_id: new price}. Updates the saved Shopify products
+        and re-works out the affected rows, so the list is right without a fresh check."""
+        titles = set()
+        for item in self.shopify_items or []:
+            if item.get("variant_id") in changes:
+                item["price"] = changes[item["variant_id"]]
+                titles.add(item["title"])
+        for title in titles:
+            self.recompute_title(title)
+        return titles
 
     def write_reports(self, show_zero=None):
         """HTML + CSV report, plus need_update CSV (URGENT and DRIFTING rows with the suggested price).
@@ -1955,8 +2088,6 @@ def write_html(rows, path, settings, report_date, tcg_updated, locations=(), hid
         stock_cells = "".join(
             f'<td class="num{" zero" if not (at or {}).get(name) else ""}">{stock_text((at or {}).get(name, 0) if at is not None else "")}</td>'
             for name in locations)
-        suggested = (f'<div class="sub suggest">set to <b>{money(r["suggested_price"])}</b></div>'
-                     if r.get("suggested_price") else "")
         extra = " · ".join(x for x in (r.get("condition") and CONDITIONS.get(r["condition"], r["condition"]),
                                         r.get("finish")) if x)
         if r["diff_pct"] is None:
@@ -1975,7 +2106,7 @@ def write_html(rows, path, settings, report_date, tcg_updated, locations=(), hid
   <td class="num">{money(r['our_price'])}{f'<div class="sub">was {money(r["compare_at"])}</div>' if r['compare_at'] else ''}</td>
   <td class="num">{money(r['cost'])}{f'<div class="sub">margin {r["margin_pct"]:.0f}%</div>' if r['margin_pct'] is not None else ''}</td>
   <td class="num">{money(r['tcg_price'])}{f'<div class="sub">typed in (snapshot {money(r["snapshot_price"])})</div>' if r['live_entered'] else ''}{f'<div class="sub">low {money(r["tcg_low"])}</div>' if r['tcg_low'] is not None else ''}{f'<div class="sub{" neg" if r["tcg_margin_pct"] < 0 else ""}">margin {r["tcg_margin_pct"]:.0f}%{" · below cost" if r["below_cost"] else ""}</div>' if r['tcg_margin_pct'] is not None else ''}</td>
-  <td class="num {diff_cls}"><b>{pct(r['diff_pct'])}</b><div class="sub">{('+' if (r['diff_amt'] or 0) > 0 else '') + money(r['diff_amt']) if r['diff_amt'] is not None else ''}</div><div class="sub">{action}</div>{suggested}</td>
+  <td class="num {diff_cls}"><b>{pct(r['diff_pct'])}</b><div class="sub">{('+' if (r['diff_amt'] or 0) > 0 else '') + money(r['diff_amt']) if r['diff_amt'] is not None else ''}</div><div class="sub">{action}</div></td>
   <td class="num"><b>{stock_text(r['stock'])}</b></td>{stock_cells}
   <td><div>{html.escape(r['tcg_name'] or '—')}</div><div class="sub">{html.escape(r['tcg_set'])}</div>
       <div class="sub">{r['match']}{(' · releases ' + r['release']) if r['presale'] and r['release'] else ''} {links}</div></td>
@@ -2065,7 +2196,6 @@ COLUMNS = [  # id, heading, width (characters), anchor, sort key
     ("tcgmargin", "Margin at TCG", 11, "e", lambda r: r["tcg_margin_pct"] if r["tcg_margin_pct"] is not None else -1e9),
     ("diff", "Difference", 9, "e", lambda r: abs(r["diff_pct"] or 0)),
     ("amt", "$ diff", 9, "e", lambda r: abs(r["diff_amt"] or 0)),
-    ("suggest", "Set to", 9, "e", lambda r: r.get("suggested_price") or 0),
     ("stock", "Stock", 6, "e", lambda r: r["stock"] if isinstance(r["stock"], (int, float)) else -1e9),
     ("match", "TCGplayer product", 32, "w", lambda r: r["tcg_name"].lower()),
     ("how", "Match", 10, "w", lambda r: r["match"]),
@@ -2091,10 +2221,12 @@ def help_text(s):
     return (f"Status: URGENT = {n(s['urgent_pct'])}%+ away from TCGplayer · DRIFTING = {n(s['drift_pct'])}%+ away "
             f"(presale items: {n(s['presale_urgent_pct'])}% / {n(s['presale_drift_pct'])}%) · CHECK MATCH = please "
             "confirm the TCGplayer product is right. Change these numbers in Settings.\n"
-            "Need update = every URGENT and DRIFTING row; 'Set to' is the suggested new price (the TCGplayer price, "
-            "for singles adjusted for condition). NO PRICE SOURCE = TCGplayer doesn't price it (sports cards, graded "
-            "slabs, accessories...). Stock = total available, then one column per Shopify location. Out-of-stock "
-            "listings are hidden unless 'Show out of stock' is ticked.\n"
+            "Need update = every URGENT and DRIFTING row; the suggested new price is the TCGplayer price (for singles "
+            "adjusted for condition). NO PRICE SOURCE = TCGplayer doesn't price it (sports cards, graded "
+            "slabs, accessories...). Stock = total available, then one column per store / warehouse (set in Settings). "
+            "Out-of-stock listings are hidden unless 'Show out of stock' is ticked. Drag a column heading to move it.\n"
+            "Select several rows (⌘/Ctrl-click or Shift-click) and press 'Update Shopify prices…' to change our prices "
+            "in Shopify; nothing is sent until you confirm.\n"
             "Margin = profit as % of the price, using Shopify's cost per item. ⚠ = TCGplayer's price is below our cost.\n"
             "TCGplayer prices are a once-a-day snapshot. ★ = presale · ⚡ = fast-moving (presale or new set), check it live "
             "· ✎ = price typed in with 'Enter live price…'.\n"
@@ -2181,6 +2313,10 @@ class App(tk.Tk):
         self.show_zero = tk.BooleanVar(value=bool(self.checker.config["settings"].get("show_zero_stock")))
         self.columns = list(COLUMNS)   # plus one stock column per Shopify location, added once they're known
         self.locations = []
+        self.loc_ids = {}      # "loc0" -> stock column name
+        self.col_order = [c[0] for c in COLUMNS]  # column ids in the order shown (headings can be dragged)
+        self._drag = None
+        self._order_set = False
         self._fill_job = self._search_job = None
         self.visible = []
         self._setup_colors()
@@ -2224,7 +2360,8 @@ class App(tk.Tk):
         settings = self.checker.config["settings"]
         settings["window"] = {"geometry": settings.get("window", {}).get("geometry") if maximized else self.geometry(),
                               "maximized": maximized, "filter": self.filter.get(), "kind": self.kind.get(),
-                              "sort": [self.sort_key, self.sort_reverse]}
+                              "sort": [self.sort_key, self.sort_reverse],
+                              "column_order": self._order_tokens()}
         settings["show_zero_stock"] = bool(self.show_zero.get())
         try:
             self.checker.save()
@@ -2337,7 +2474,7 @@ class App(tk.Tk):
             if sum(w for c, w in fixed.items() if c not in hidden) + flex_min <= avail:
                 break
             hidden.extend(loc_ids if group == "LOCATIONS" else [group])
-        wanted = tuple(c[0] for c in self.columns if c[0] not in hidden) if hidden else ("#all",)
+        wanted = tuple(c for c in self.col_order if c not in hidden)
         if tuple(self.tk.splitlist(self.tree["displaycolumns"])) != wanted:
             self.tree["displaycolumns"] = wanted
         left = avail - sum(w for c, w in fixed.items() if c not in hidden)
@@ -2421,6 +2558,7 @@ class App(tk.Tk):
             ("✓ Match is correct", self.confirm_match),
             ("Choose a different match…", self.change_match),
             ("Enter live price…", self.enter_live_price),
+            ("Update Shopify prices…", self.update_shopify_prices),
             ("We price this ourselves", self.toggle_self_priced),
             ("Hide this product", self.hide_product),
             ("Undo my choice", self.reset_choice))]
@@ -2431,7 +2569,7 @@ class App(tk.Tk):
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=12, pady=4)
-        self.tree = ttk.Treeview(body, columns=[c[0] for c in self.columns], show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(body, columns=[c[0] for c in self.columns], show="headings", selectmode="extended")
         self._setup_columns()
         self.tree.bind("<Configure>", self._fit_columns, add="+")
         for tag, color in ROW_COLORS.items():
@@ -2448,10 +2586,15 @@ class App(tk.Tk):
         for button in (("<Button-2>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)):
             self.tree.bind(button, self._context_menu)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_detail())
+        self.tree.bind("<ButtonPress-1>", self._drag_start, add="+")
+        self.tree.bind("<B1-Motion>", self._drag_move, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._drag_end, add="+")
 
         self.menu = tk.Menu(self, tearoff=0)
         for b in self.action_buttons:
             self.menu.add_command(label=b.cget("text"), command=b.cget("command"))
+        self.heading_menu = tk.Menu(self, tearoff=0)
+        self.heading_menu.add_command(label="Reset column order", command=self.reset_column_order)
 
     # ------------------------------------------------------------------ background work
     def run_in_background(self, label, work, done=None):
@@ -2566,15 +2709,21 @@ class App(tk.Tk):
     # ------------------------------------------------------------------ table
     def _setup_columns(self):
         """(Re)build the table's columns: the fixed ones plus one stock column per Shopify location."""
+        tokens = self._order_tokens() if self._order_set else None  # keep a dragged order when columns change
+        self._order_set = True
         self.locations = self.checker.locations()
         self.columns = list(COLUMNS)
         at = next(i for i, c in enumerate(self.columns) if c[0] == "stock") + 1
-        short = short_names(self.locations)
+        grouped = bool(self.checker.config["settings"].get("stock_columns"))
+        short = {n: n for n in self.locations} if grouped else short_names(self.locations)
+        self.loc_ids = {}
         for i, name in enumerate(self.locations):  # full names are in the details below the table
+            self.loc_ids[f"loc{i}"] = name
             self.columns.insert(at + i, (f"loc{i}", short[name], 6, "e",
                                          lambda r, n=name: (r.get("locations") or {}).get(n, 0)))
         self.tree["displaycolumns"] = ("#all",)
         self.tree["columns"] = [c[0] for c in self.columns]
+        self._apply_saved_order(tokens)
         for cid, heading, _, anchor, _ in self.columns:
             self.tree.heading(cid, text=heading, command=lambda c=cid: self.sort_by(c))
             self.tree.column(cid, minwidth=30, anchor=anchor, stretch=False)
@@ -2592,7 +2741,7 @@ class App(tk.Tk):
         locs = tuple("" if at is None else at.get(n, 0) for n in self.locations)
         return (r["tag"], flags, product, money(r["our_price"]), money(r["cost"]),
                 margin(r["margin_pct"]), money(r["tcg_price"]), tcg_margin, pct(r["diff_pct"]), amt,
-                money(r.get("suggested_price")), stock_text(r["stock"])) + locs + (r["tcg_name"] or "—", r["match"])
+                stock_text(r["stock"])) + locs + (r["tcg_name"] or "—", r["match"])
 
     def _matches_filter(self, r, code):
         if code is None:
@@ -2694,8 +2843,15 @@ class App(tk.Tk):
         self.refresh_table()
 
     def _selected(self):
+        """The row the details are shown for: the last one clicked, if it's selected, else the first selected."""
         sel = self.tree.selection()
-        return self.visible[int(sel[0])] if sel and int(sel[0]) < len(self.visible) else None
+        if not sel:
+            return None
+        iid = self.tree.focus() if self.tree.focus() in sel else sel[0]
+        return self.visible[int(iid)] if int(iid) < len(self.visible) else None
+
+    def _selected_rows(self):
+        return [self.visible[int(i)] for i in self.tree.selection() if int(i) < len(self.visible)]
 
     def _update_detail(self):
         r = self._selected()
@@ -2712,6 +2868,12 @@ class App(tk.Tk):
         stock = f"Stock {stock_text(r['stock']) or '—'}"
         if at is not None:
             stock += "  ·  " + "  ·  ".join(f"{n}: {at.get(n, 0)}" for n in self.locations)
+        other = untracked_stock(r, self.checker.config["settings"].get("stock_columns"))
+        if other:
+            stock += "  ·  not counted: " + ", ".join(f"{n} {q}" for n, q in other.items())
+        n = len(self.tree.selection())
+        if n > 1:
+            stock += f"  ·  ({n} rows selected)"
         parts.append(stock)
         if r.get("suggested_price"):
             parts.append(f"Suggested new price: {money(r['suggested_price'])} (TCGplayer"
@@ -2749,12 +2911,77 @@ class App(tk.Tk):
         self._size_detail()
 
     def _context_menu(self, event):
+        if self.tree.identify_region(event.x, event.y) == "heading":
+            self.heading_menu.tk_popup(event.x_root, event.y_root)
+            return
         row = self.tree.identify_row(event.y)
         if row:
-            self.tree.selection_set(row)
+            if row not in self.tree.selection():  # right-click inside a multi-row selection keeps it
+                self.tree.selection_set(row)
+            self.tree.focus(row)
             for i in range(1, len(self.action_buttons)):  # same rule as the buttons: no changes mid-check
                 self.menu.entryconfigure(i, state="disabled" if self.busy else "normal")
             self.menu.tk_popup(event.x_root, event.y_root)
+
+    # ------------------------------------------------------------------ column order (drag a heading)
+    def _order_tokens(self):
+        """The column order to save: location columns by name, so they keep their place if columns change."""
+        return [f"loc:{self.loc_ids[c]}" if c in self.loc_ids else c for c in self.col_order]
+
+    def _apply_saved_order(self, tokens=None):
+        if tokens is None:
+            tokens = self.checker.config["settings"].get("window", {}).get("column_order") or []
+        by_token = {f"loc:{n}": c for c, n in self.loc_ids.items()}
+        ids = [c[0] for c in self.columns]
+        order = []
+        for t in tokens:
+            cid = by_token.get(t, t)
+            if cid in ids and cid not in order:
+                order.append(cid)
+        for i, cid in enumerate(ids):  # columns not in the saved order go after the column before them
+            if cid not in order:
+                before = ids[i - 1] if i else None
+                order.insert(order.index(before) + 1 if before in order else len(order), cid)
+        self.col_order = order
+
+    def reset_column_order(self):
+        self._apply_saved_order([])
+        self._fit_columns()
+
+    def _heading_at(self, x):
+        """Column id under x in the heading row, or None."""
+        col = self.tree.identify_column(x)  # "#3" = third column shown
+        shown = self.tree["displaycolumns"]
+        shown = self.col_order if shown in ("#all", ("#all",)) else self.tk.splitlist(shown)
+        try:
+            return shown[int(col[1:]) - 1]
+        except (ValueError, IndexError):
+            return None
+
+    def _drag_start(self, event):
+        self._drag = None
+        if self.tree.identify_region(event.x, event.y) == "heading":
+            self._drag = {"col": self._heading_at(event.x), "x": event.x, "moved": False}
+
+    def _drag_move(self, event):
+        if self._drag and abs(event.x - self._drag["x"]) > 8:
+            self._drag["moved"] = True
+            self.tree.configure(cursor="sb_h_double_arrow")
+
+    def _drag_end(self, event):
+        drag, self._drag = self._drag, None
+        if not drag or not drag["moved"]:
+            return
+        self.tree.configure(cursor="")
+        target = self._heading_at(event.x)
+        src = drag["col"]
+        if not src or not target or target == src:
+            return
+        order = [c for c in self.col_order if c != src]
+        i = order.index(target)
+        order.insert(i + 1 if self.col_order.index(src) < self.col_order.index(target) else i, src)
+        self.col_order = order
+        self._fit_columns()
 
     # ------------------------------------------------------------------ row actions
     def open_tcgplayer(self):
@@ -2824,6 +3051,20 @@ class App(tk.Tk):
         self.checker.recompute_title(r["shopify_title"])
         self.refresh_table(fallback_index=int(sel[0]) if sel else None)
 
+    def update_shopify_prices(self):
+        """Change our price in Shopify for the selected rows, after the person checks every new price."""
+        rows = self._selected_rows()
+        if not rows or self.busy:
+            return
+        missing = [r for r in rows if not r.get("variant_id")]
+        rows = [r for r in rows if r.get("variant_id")]
+        if not rows:
+            messagebox.showinfo("Update Shopify prices", "These rows came from a Shopify file export or an older "
+                                "check, so they can't be changed from here. Press Check prices now, then try again.",
+                                parent=self)
+            return
+        PriceUpdate(self, rows, skipped=len(missing))
+
     def toggle_self_priced(self):
         r = self._selected()
         if not r:
@@ -2880,6 +3121,151 @@ class App(tk.Tk):
 
     def open_settings(self):
         Settings(self)
+
+
+def target_price(r):
+    """The price to move a listing to: the suggested price, else the TCGplayer price, else our price."""
+    for v in (r.get("suggested_price"), r.get("tcg_price"), r.get("our_price")):
+        if v:
+            return round(v, 2)
+    return None
+
+
+class PriceUpdate(tk.Toplevel):
+    """Review and send new prices for the selected listings. Nothing goes to Shopify until Send is pressed
+    and the summary is confirmed."""
+    MAX_ROWS = 300
+
+    def __init__(self, app, rows, skipped=0):
+        super().__init__(app)
+        self.app = app
+        self.title("Update Shopify prices")
+        self.transient(app)
+        if len(rows) > self.MAX_ROWS:
+            messagebox.showinfo("Update Shopify prices", f"{len(rows)} rows are selected; only the first "
+                                f"{self.MAX_ROWS} are shown. Do the rest in another batch.", parent=app)
+            rows = rows[:self.MAX_ROWS]
+        self.rows = rows
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both", expand=True)
+        intro = (f"{len(rows)} listing{'s' if len(rows) != 1 else ''} selected. Check the new price for each one; "
+                 "it starts at the suggested price (TCGplayer). Clear a box or leave our price to skip that listing.\n"
+                 "Nothing changes in Shopify until you press Send and confirm.")
+        if skipped:
+            intro += f"\n{skipped} selected row(s) can't be changed from here (no Shopify link); run a fresh check first."
+        ttk.Label(f, text=intro, justify="left", wraplength=760).pack(anchor="w", pady=(0, 8))
+
+        outer = ttk.Frame(f)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, highlightthickness=0, background=ttk.Style().lookup("TFrame", "background") or "white",
+                           height=min(32 * (len(rows) + 1), 420), width=820)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        grid = ttk.Frame(canvas)
+        grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=grid, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for c, head in enumerate(("Product", "Our price", "TCGplayer", "Cost", "New price", "Change")):
+            ttk.Label(grid, text=head, font=app.fonts["bold"]).grid(row=0, column=c, sticky="w", padx=6, pady=(0, 4))
+        self.entries, self.changes = [], []
+        for i, r in enumerate(rows, 1):
+            name = r["shopify_title"] + (f" — {r['variant']}" if r["variant"] else "")
+            ttk.Label(grid, text=name[:60] + ("…" if len(name) > 60 else "")).grid(row=i, column=0, sticky="w", padx=6)
+            for c, v in ((1, r["our_price"]), (2, r["tcg_price"]), (3, r["cost"])):
+                ttk.Label(grid, text=money(v) or "—").grid(row=i, column=c, sticky="e", padx=6)
+            var = tk.StringVar(value=f"{target_price(r):.2f}" if target_price(r) else "")
+            ttk.Entry(grid, textvariable=var, width=9, justify="right").grid(row=i, column=4, padx=6, pady=1)
+            change = ttk.Label(grid, text="", width=16)
+            change.grid(row=i, column=5, sticky="w", padx=6)
+            var.trace_add("write", lambda *_, r=r, v=var, l=change: self._show_change(r, v, l))
+            self._show_change(r, var, change)
+            self.entries.append(var)
+
+        buttons = ttk.Frame(f)
+        buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text="Use suggested prices", command=self.fill_suggested).pack(side="left")
+        ttk.Button(buttons, text="Keep our prices", command=self.fill_ours).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Send to Shopify…", command=self.send).pack(side="right", padx=6)
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    @staticmethod
+    def _parse(text):
+        text = text.strip().replace("$", "").replace(",", "")
+        return float(text) if text else None
+
+    def _show_change(self, r, var, label):
+        try:
+            new = self._parse(var.get())
+        except ValueError:
+            label.config(text="not a price", foreground=self.app.colors["warn"])
+            return
+        if new is None or r["our_price"] is None or round(new, 2) == round(r["our_price"], 2):
+            label.config(text="no change", foreground=self.app.colors["muted"])
+            return
+        pct_change = (new - r["our_price"]) / r["our_price"] * 100 if r["our_price"] else 0
+        warn = " ⚠ below cost" if r["cost"] and new < r["cost"] else ""
+        label.config(text=f"{pct_change:+.1f}%{warn}",
+                     foreground=self.app.colors["warn"] if warn or abs(pct_change) >= 50 else self.app.colors["text"])
+
+    def fill_suggested(self):
+        for r, var in zip(self.rows, self.entries):
+            p = target_price(r)
+            var.set(f"{p:.2f}" if p else "")
+
+    def fill_ours(self):
+        for r, var in zip(self.rows, self.entries):
+            var.set(f"{r['our_price']:.2f}" if r["our_price"] else "")
+
+    def send(self):
+        changes, bad = [], []
+        for r, var in zip(self.rows, self.entries):
+            try:
+                new = self._parse(var.get())
+            except ValueError:
+                bad.append(r)
+                continue
+            if new is None or (r["our_price"] is not None and round(new, 2) == round(r["our_price"], 2)):
+                continue
+            if new <= 0:
+                bad.append(r)
+                continue
+            changes.append((r, round(new, 2)))
+        if bad:
+            messagebox.showerror("Update Shopify prices", f"{len(bad)} price(s) aren't valid (must be a number above "
+                                 f"0), e.g. {bad[0]['shopify_title']}.", parent=self)
+            return
+        if not changes:
+            messagebox.showinfo("Update Shopify prices", "None of the prices are different from ours.", parent=self)
+            return
+        lines = [f"{r['shopify_title'][:50]}{' — ' + r['variant'] if r['variant'] else ''}: "
+                 f"{money(r['our_price'])} → {money(p)}" for r, p in changes[:15]]
+        if len(changes) > 15:
+            lines.append(f"…and {len(changes) - 15} more")
+        below = sum(1 for r, p in changes if r["cost"] and p < r["cost"])
+        warn = f"\n\n⚠ {below} of these would be below our cost." if below else ""
+        if not messagebox.askyesno(
+                "Send to Shopify?", f"Change {len(changes)} price{'s' if len(changes) != 1 else ''} in Shopify? "
+                "This changes the live price customers see (online and in the stores' POS).\n\n"
+                + "\n".join(lines) + warn, icon="warning", default="no", parent=self):
+            return
+        self.destroy()
+        app = self.app
+
+        def done(result):
+            changed, failed = result
+            app.refresh_table()
+            app.show_status()
+            msg = f"Changed {len(changed)} price{'s' if len(changed) != 1 else ''} in Shopify."
+            if failed:
+                msg += f"\n\n{len(failed)} not changed:\n" + "\n".join(
+                    f"• {r['shopify_title'][:50]}: {why}" for r, why in failed[:10])
+            msg += "\n\nEvery change is logged in reports/price_changes.csv."
+            (messagebox.showwarning if failed else messagebox.showinfo)("Update Shopify prices", msg, parent=app)
+
+        app.run_in_background("Sending prices to Shopify…",
+                               lambda progress: app.checker.push_prices(changes, progress), done)
 
 
 class MatchPicker(tk.Toplevel):
@@ -3116,6 +3502,21 @@ class Settings(tk.Toplevel):
             self.vars[key] = v
             r += 2
 
+        ttk.Label(f, text="Stock columns, in order: one per line, as  Column name: Shopify location, other location").grid(
+            row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        self.stock_text = tk.Text(f, width=80, height=5, wrap="none", font=app.fonts["body"])
+        self.stock_text.insert("1.0", "\n".join(f"{c['name']}: {', '.join(c.get('locations', []))}"
+                                                 for c in s.get("stock_columns") or []))
+        self.stock_text.grid(row=r, column=0, columnspan=3, sticky="we")
+        r += 1
+        seen = app.checker.shopify_locations()
+        ttk.Label(f, text=("Shopify locations: " + ", ".join(seen) if seen else "Shopify locations show here after a check")
+                  + ". Locations in no column aren't counted. Leave empty for one column per location.",
+                  foreground=app.colors["faint"], wraplength=640, justify="left").grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(2, 6))
+        r += 1
+
         ttk.Label(f, text="Shopify login file (config.yaml):").grid(row=r, column=0, columnspan=3, sticky="w")
         self.cred = tk.StringVar(value=str(app.checker.credentials_path or "(not chosen yet)"))
         ttk.Entry(f, textvariable=self.cred, width=70, state="readonly").grid(row=r + 1, column=0, columnspan=2, sticky="we")
@@ -3142,6 +3543,18 @@ class Settings(tk.Toplevel):
         except ValueError:
             messagebox.showerror("Settings", "The percentages must be numbers.", parent=self)
             return
+        columns = []
+        for line in self.stock_text.get("1.0", "end").splitlines():
+            if not line.strip():
+                continue
+            name, _, locs = line.partition(":")
+            locs = [l.strip() for l in locs.split(",") if l.strip()] if _ else [name.strip()]
+            if not name.strip() or any(c["name"] == name.strip() for c in columns):
+                messagebox.showerror("Settings", f"Stock columns: each line needs its own name ('{line.strip()}').",
+                                     parent=self)
+                return
+            columns.append({"name": name.strip(), "locations": locs})
+        s["stock_columns"] = columns
         s["check_singles"] = self.singles.get()
         if self.text_size.get() in TEXT_SIZES:
             s["text_size"] = TEXT_SIZES[self.text_size.get()]
@@ -3155,6 +3568,8 @@ class Settings(tk.Toplevel):
             s["credentials_file"] = self.cred.get()
         self.app.checker.save()
         self.app.apply_text_size()
+        self.app.checker.regroup_stock()
+        self.app.refresh_table()
         self.destroy()
         if self.app.checker.shopify_items:
             self.app.run_in_background("Applying settings…", lambda progress: self.app.checker.recompute(progress),
