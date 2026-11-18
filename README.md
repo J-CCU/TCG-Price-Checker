@@ -360,16 +360,8 @@ Downloads), this folder is used instead:
 
 ## Building the app
 
-Build once per computer type, with Python 3.10+ from python.org. The easy way: double-click the build
-launcher next to the script.
-
-- Mac: `Build App.command`. Makes `TCG Price Checker.app` and `TCG Price Checker.app.zip` (to send to
-  another Mac) and shows them in Finder. The first time, macOS may ask before running it: right-click it >
-  Open.
-- Windows: `Build App.bat`. Makes `TCG Price Checker.exe`.
-
-Each takes about a minute (longer the first time) and needs an internet connection to download
-PyInstaller. Or run it yourself:
+Build once per computer type, with Python 3.10+ from python.org. In a terminal, in the folder with the
+script, run:
 
 ```
 py tcg_price_checker.py --build-app        # Windows -> TCG Price Checker.exe
@@ -379,9 +371,10 @@ python3 tcg_price_checker.py --build-app   # Mac     -> TCG Price Checker.app
 It creates a throwaway virtual environment in a temp folder, installs PyInstaller and Pillow from PyPI,
 draws the app icon in code, and runs PyInstaller (`--windowed`; `--onefile` on Windows; bundle identifier
 `com.tcgpricechecker.app` on Mac). The finished app is placed next to the script and the temp folder is
-removed. A Mac app only runs on Macs with the same chip type as the one that built it.
+removed. It takes about a minute (longer the first time) and needs an internet connection to download
+PyInstaller. A Mac app only runs on Macs with the same chip type as the one that built it.
 
-To ship the Mac app, send the `.zip` (`Build App.command` makes it; or zip `TCG Price Checker.app` yourself).
+To ship the Mac app, zip it first (right-click `TCG Price Checker.app` > Compress).
 Rebuild after every change to the script: the app keeps the code it was built with.
 
 ## Speed
@@ -437,7 +430,6 @@ main thread.
 | Path | Notes |
 | --- | --- |
 | `tcg_price_checker.py` | The whole app: matching (sealed and singles), Shopify and tcgcsv access, window, reports, build. |
-| `Build App.command`, `Build App.bat` | Double-click to build the Mac app / Windows `.exe` (see [Building the app](#building-the-app)). |
 | `products.json`, `products.json.bak` | Saved choices and settings (created at runtime, not in the repo). |
 | `cache/`, `reports/`, `error_log.txt` | Created at runtime. |
 | `config.yaml` | Your Shopify login file. Keep it out of git; it can live anywhere. |
