@@ -2285,6 +2285,78 @@ class Flow(ttk.Frame):
             row_h = max(row_h, h)
         if pixels(self.cget("height")) != y + row_h:
             self.configure(height=y + row_h)
+            self.event_generate("<<FlowChanged>>")
+
+
+class ScrollArea(ttk.Frame):
+    """Holds a frame (.inner) that is stretched to the visible size when it fits and scrolls when the
+    window is too small for it. Scrollbars only appear when they are needed."""
+
+    def __init__(self, master, width=None, height=None, **kw):
+        super().__init__(master, **kw)
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0,
+                                background=ttk.Style().lookup("TFrame", "background") or "white")
+        if width:
+            self.canvas.configure(width=width)
+        if height:
+            self.canvas.configure(height=height)
+        self.ysb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.xsb = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.ysb.set, xscrollcommand=self.xsb.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.inner = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
+        self._pending = False
+        self._need = {"x": False, "y": False}
+        self.canvas.bind("<Configure>", lambda e: self.refit())
+        self.inner.bind("<Configure>", lambda e: self.refit())
+        top = self.winfo_toplevel()
+        top.bind("<<FlowChanged>>", lambda e: self.refit(), add="+")
+        top.bind("<MouseWheel>", self._wheel, add="+")
+        top.bind("<Shift-MouseWheel>", lambda e: self._wheel(e, "x"), add="+")
+        top.bind("<Button-4>", lambda e: self._scroll(e, -1, "y"), add="+")
+        top.bind("<Button-5>", lambda e: self._scroll(e, 1, "y"), add="+")
+
+    def refit(self):
+        """Call after the contents change size (wrapped text, added rows)."""
+        if not self._pending:
+            self._pending = True
+            self.after_idle(self._fit)
+
+    def _fit(self):
+        self._pending = False
+        if not self.winfo_exists():
+            return
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        need_w, need_h = self.inner.winfo_reqwidth(), self.inner.winfo_reqheight()
+        w, h = max(cw, need_w), max(ch, need_h)
+        self.canvas.itemconfigure(self._win, width=w, height=h)
+        self.canvas.configure(scrollregion=(0, 0, w, h))
+        for axis, bar, needed, place in (("y", self.ysb, need_h > ch, dict(row=0, column=1, sticky="ns")),
+                                         ("x", self.xsb, need_w > cw, dict(row=1, column=0, sticky="ew"))):
+            if needed != self._need[axis]:
+                self._need[axis] = needed
+                if needed:
+                    bar.grid(**place)
+                else:
+                    bar.grid_remove()
+                    (self.canvas.yview_moveto if axis == "y" else self.canvas.xview_moveto)(0)
+
+    def _scroll(self, event, units, axis):
+        # lists and text boxes scroll themselves; only scroll here for the rest of this area
+        if not units or not self._need[axis] or isinstance(event.widget, (tk.Text, ttk.Treeview)):
+            return
+        if not str(event.widget).startswith(str(self)):
+            return
+        (self.canvas.yview_scroll if axis == "y" else self.canvas.xview_scroll)(units, "units")
+
+    def _wheel(self, event, axis="y"):
+        d = event.delta
+        self._scroll(event, -d if abs(d) < 120 else -int(d / 120), axis)
 
 
 class App(tk.Tk):
@@ -3153,19 +3225,22 @@ class PriceUpdate(tk.Toplevel):
                  "Nothing changes in Shopify until you press Send and confirm.")
         if skipped:
             intro += f"\n{skipped} selected row(s) can't be changed from here (no Shopify link); run a fresh check first."
-        ttk.Label(f, text=intro, justify="left", wraplength=760).pack(anchor="w", pady=(0, 8))
+        self.minsize(420, 300)
+        intro_label = ttk.Label(f, text=intro, justify="left", wraplength=760)
+        intro_label.pack(anchor="w", fill="x", pady=(0, 8))
+        f.bind("<Configure>", lambda e: intro_label.configure(wraplength=max(200, e.width - 30)), add="+")
 
-        outer = ttk.Frame(f)
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, highlightthickness=0, background=ttk.Style().lookup("TFrame", "background") or "white",
-                           height=min(32 * (len(rows) + 1), 420), width=820)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        grid = ttk.Frame(canvas)
-        grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=grid, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        # buttons are packed before the list so they stay visible when the window is made small
+        buttons = Flow(f)
+        buttons.pack(side="bottom", fill="x", pady=(12, 0))
+        buttons.add(ttk.Button(buttons, text="Send to Shopify…", command=self.send))
+        buttons.add(ttk.Button(buttons, text="Cancel", command=self.destroy))
+        buttons.add(ttk.Button(buttons, text="Use suggested prices", command=self.fill_suggested), space_before=18)
+        buttons.add(ttk.Button(buttons, text="Keep our prices", command=self.fill_ours))
+
+        area = ScrollArea(f, width=820, height=min(32 * (len(rows) + 1), 420))
+        area.pack(fill="both", expand=True)
+        grid = area.inner
         for c, head in enumerate(("Product", "Our price", "TCGplayer", "Cost", "New price", "Change")):
             ttk.Label(grid, text=head, font=app.fonts["bold"]).grid(row=0, column=c, sticky="w", padx=6, pady=(0, 4))
         self.entries, self.changes = [], []
@@ -3181,14 +3256,9 @@ class PriceUpdate(tk.Toplevel):
             var.trace_add("write", lambda *_, r=r, v=var, l=change: self._show_change(r, v, l))
             self._show_change(r, var, change)
             self.entries.append(var)
-
-        buttons = ttk.Frame(f)
-        buttons.pack(fill="x", pady=(12, 0))
-        ttk.Button(buttons, text="Use suggested prices", command=self.fill_suggested).pack(side="left")
-        ttk.Button(buttons, text="Keep our prices", command=self.fill_ours).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
-        ttk.Button(buttons, text="Send to Shopify…", command=self.send).pack(side="right", padx=6)
         self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()  # measure the finished list, then open big enough to show it (if the screen allows)
+        fit_window(self, grid.winfo_reqwidth() + 60, self.winfo_reqheight() + 20, 0.85, 0.85)
 
     @staticmethod
     def _parse(text):
@@ -3420,10 +3490,21 @@ class Settings(tk.Toplevel):
         self.app = app
         self.title("Settings")
         self.transient(app)
-        self.resizable(False, False)
+        self.minsize(520, 320)
         s = app.checker.config["settings"]
-        f = ttk.Frame(self, padding=16)
+        # Save / Cancel are packed first so they stay visible; everything else scrolls if the window is small
+        buttons = ttk.Frame(self, padding=(16, 8, 16, 14))
+        buttons.pack(side="bottom", fill="x")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Save", command=self.save).pack(side="right", padx=6)
+        ttk.Separator(self).pack(side="bottom", fill="x")
+        self.area = ScrollArea(self)
+        self.area.pack(fill="both", expand=True)
+        f = ttk.Frame(self.area.inner, padding=16)
         f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+        self.wraps = []  # (label, space kept free beside it); wrap widths follow the window width
+        self.area.canvas.bind("<Configure>", self._rewrap, add="+")
         self.vars = {}
         r = 0
         ttk.Label(f, text="Text size").grid(row=r, column=0, sticky="w", pady=3)
@@ -3433,62 +3514,69 @@ class Settings(tk.Toplevel):
                                                  f"Custom ({current:+d})"))
         ttk.Combobox(f, textvariable=self.text_size, values=names, state="readonly", width=10).grid(
             row=r, column=1, sticky="w")
-        ttk.Label(f, text=f"(or {'⌘' if IS_MAC else 'Ctrl'} + / − in the main window)", foreground=app.colors["faint"]).grid(
-            row=r, column=2, sticky="w", padx=6)
+        r += 1
+        ttk.Label(f, text=f"(or {'⌘' if IS_MAC else 'Ctrl'} + / − in the main window)",
+                  foreground=app.colors["faint"]).grid(row=r, column=1, columnspan=2, sticky="w", pady=(0, 3))
         r += 1
         for key, label in [("drift_pct", "Drifting when our price is at least this % away"),
                            ("urgent_pct", "Urgent when our price is at least this % away"),
                            ("presale_drift_pct", "Presale: drifting at %"),
                            ("presale_urgent_pct", "Presale: urgent at %")]:
-            ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", pady=3)
+            self._wrap(ttk.Label(f, text=label), 330).grid(row=r, column=0, sticky="w", pady=3)
             v = tk.StringVar(value=f"{s[key]:g}")  # 3.0 -> "3"
             ttk.Spinbox(f, from_=0, to=100, increment=1, textvariable=v, width=6).grid(row=r, column=1, sticky="w")
             self.vars[key] = v
             r += 1
 
-        ttk.Label(f, text="Compare our price against TCGplayer's").grid(row=r, column=0, sticky="w", pady=3)
+        self._wrap(ttk.Label(f, text="Compare our price against TCGplayer's"), 330).grid(row=r, column=0, sticky="w", pady=3)
         self.field = tk.StringVar(value=s.get("tcg_price_field", "marketPrice"))
         fr = ttk.Frame(f)
         fr.grid(row=r, column=1, columnspan=2, sticky="w")
         ttk.Radiobutton(fr, text="Market price", value="marketPrice", variable=self.field).pack(side="left")
         ttk.Radiobutton(fr, text="Lowest listing", value="lowPrice", variable=self.field).pack(side="left", padx=10)
         r += 1
-        ttk.Label(f, text="Flag as fast-moving when the set came out within this many days").grid(row=r, column=0, sticky="w", pady=3)
+        self._wrap(ttk.Label(f, text="Flag as fast-moving when the set came out within this many days"), 330).grid(
+            row=r, column=0, sticky="w", pady=3)
         self.vars["new_release_days"] = tk.StringVar(value=str(s.get("new_release_days", 30)))
         ttk.Spinbox(f, from_=0, to=365, increment=1, textvariable=self.vars["new_release_days"], width=6).grid(row=r, column=1, sticky="w")
         r += 1
 
         ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=10)
         r += 1
-        ttk.Label(f, text="Sealed product types (matched to TCGplayer sealed products):").grid(row=r, column=0, columnspan=3, sticky="w")
+        self._wrap(ttk.Label(f, text="Sealed product types (matched to TCGplayer sealed products):"), 40).grid(
+            row=r, column=0, columnspan=3, sticky="w")
         r += 1
-        types_frame = ttk.Frame(f)
-        types_frame.grid(row=r, column=0, columnspan=3, sticky="w")
+        types_frame = Flow(f, gap=12)
+        types_frame.grid(row=r, column=0, columnspan=3, sticky="we")
         known = app.checker.product_types() or [(t, None) for t in s["sealed_types"]]
         chosen = {t.lower() for t in s["sealed_types"]}
         self.type_vars = {}
         for i, (t, n) in enumerate(t for t in known if t[0] and t[0].lower() != "singles"):
             v = tk.BooleanVar(value=t.lower() in chosen)
-            ttk.Checkbutton(types_frame, text=f"{t} ({n})" if n else t, variable=v).grid(row=i // 4, column=i % 4, sticky="w", padx=(0, 12))
+            types_frame.add(ttk.Checkbutton(types_frame, text=f"{t} ({n})" if n else t, variable=v))
             self.type_vars[t] = v
         r += 1
         self.drafts = tk.BooleanVar(value=s.get("include_drafts", False))
         ttk.Checkbutton(f, text="Also check draft (not published) products", variable=self.drafts).grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
         r += 1
         self.singles = tk.BooleanVar(value=s.get("check_singles", True))
-        ttk.Checkbutton(f, text="Price-check TCG singles too (MTG, Pokemon, One Piece... by their Shopify tags)",
-                        variable=self.singles).grid(row=r, column=0, columnspan=3, sticky="w")
+        singles = Flow(f)
+        singles.grid(row=r, column=0, columnspan=3, sticky="we")
+        singles.add(ttk.Checkbutton(singles, text="Price-check TCG singles too", variable=self.singles))
+        singles.add(self._wrap(ttk.Label(singles, text="(MTG, Pokemon, One Piece... by their Shopify tags)"), 40))
         r += 1
-        ttk.Label(f, text="Singles: % of TCGplayer's Near Mint price for each condition:").grid(
+        self._wrap(ttk.Label(f, text="Singles: % of TCGplayer's Near Mint price for each condition:"), 40).grid(
             row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
         r += 1
-        cond = ttk.Frame(f)
-        cond.grid(row=r, column=0, columnspan=3, sticky="w")
+        cond = Flow(f, gap=14)
+        cond.grid(row=r, column=0, columnspan=3, sticky="we")
         self.cond_vars = {}
-        for i, code in enumerate(CONDITIONS):
-            ttk.Label(cond, text=code, foreground=app.colors["muted"]).grid(row=0, column=2 * i, sticky="e", padx=(0 if i == 0 else 12, 4))
+        for code in CONDITIONS:
+            pair = ttk.Frame(cond)
+            ttk.Label(pair, text=code, foreground=app.colors["muted"]).pack(side="left", padx=(0, 4))
             v = tk.StringVar(value=f"{float(s['condition_pct'].get(code, 100)):g}")
-            ttk.Spinbox(cond, from_=0, to=200, increment=5, textvariable=v, width=5).grid(row=0, column=2 * i + 1)
+            ttk.Spinbox(pair, from_=0, to=200, increment=5, textvariable=v, width=5).pack(side="left")
+            cond.add(pair)
             self.cond_vars[code] = v
         r += 1
 
@@ -3496,37 +3584,55 @@ class Settings(tk.Toplevel):
         r += 1
         for key, label in [("ignore_words", "Skip products whose title contains (comma separated):"),
                            ("self_priced_words", "We price it ourselves when the title contains:")]:
-            ttk.Label(f, text=label).grid(row=r, column=0, columnspan=3, sticky="w")
+            self._wrap(ttk.Label(f, text=label), 40).grid(row=r, column=0, columnspan=3, sticky="w")
             v = tk.StringVar(value=", ".join(w.strip() for w in s[key]))
-            ttk.Entry(f, textvariable=v, width=80).grid(row=r + 1, column=0, columnspan=3, sticky="we", pady=(0, 6))
+            ttk.Entry(f, textvariable=v, width=30).grid(row=r + 1, column=0, columnspan=3, sticky="we", pady=(0, 6))
             self.vars[key] = v
             r += 2
 
-        ttk.Label(f, text="Stock columns, in order: one per line, as  Column name: Shopify location, other location").grid(
-            row=r, column=0, columnspan=3, sticky="w")
+        self._wrap(ttk.Label(f, text="Stock columns, in order: one per line, as  Column name: Shopify location, "
+                                     "other location"), 40).grid(row=r, column=0, columnspan=3, sticky="w")
         r += 1
-        self.stock_text = tk.Text(f, width=80, height=5, wrap="none", font=app.fonts["body"])
+        self.stock_text = tk.Text(f, width=30, height=5, wrap="word", font=app.fonts["body"])
         self.stock_text.insert("1.0", "\n".join(f"{c['name']}: {', '.join(c.get('locations', []))}"
                                                  for c in s.get("stock_columns") or []))
         self.stock_text.grid(row=r, column=0, columnspan=3, sticky="we")
         r += 1
         seen = app.checker.shopify_locations()
-        ttk.Label(f, text=("Shopify locations: " + ", ".join(seen) if seen else "Shopify locations show here after a check")
-                  + ". Locations in no column aren't counted. Leave empty for one column per location.",
-                  foreground=app.colors["faint"], wraplength=640, justify="left").grid(
+        self._wrap(ttk.Label(f, text=("Shopify locations: " + ", ".join(seen) if seen else
+                                      "Shopify locations show here after a check")
+                             + ". Locations in no column aren't counted. Leave empty for one column per location.",
+                             foreground=app.colors["faint"], justify="left"), 40).grid(
             row=r, column=0, columnspan=3, sticky="w", pady=(2, 6))
         r += 1
 
         ttk.Label(f, text="Shopify login file (config.yaml):").grid(row=r, column=0, columnspan=3, sticky="w")
         self.cred = tk.StringVar(value=str(app.checker.credentials_path or "(not chosen yet)"))
-        ttk.Entry(f, textvariable=self.cred, width=70, state="readonly").grid(row=r + 1, column=0, columnspan=2, sticky="we")
+        ttk.Entry(f, textvariable=self.cred, width=30, state="readonly").grid(row=r + 1, column=0, columnspan=2, sticky="we")
         ttk.Button(f, text="Choose file…", command=self.browse).grid(row=r + 1, column=2, padx=6)
         r += 2
+        self.bind("<Escape>", lambda e: self.destroy())
+        fit_window(self, 900, 1000, 0.8, 0.85)
 
-        buttons = ttk.Frame(f)
-        buttons.grid(row=r, column=0, columnspan=3, sticky="e", pady=(14, 0))
-        ttk.Button(buttons, text="Save", command=self.save).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left")
+    def _wrap(self, label, reserve, fixed=None):
+        """Let a label's text wrap: to (window width - reserve), or to a fixed width."""
+        if fixed:
+            label.configure(wraplength=fixed)
+        else:
+            self.wraps.append((label, reserve))
+        return label
+
+    def _rewrap(self, _event=None):
+        # follow the visible width (not the contents' width), so long text never forces sideways scrolling
+        visible = self.area.canvas.winfo_width()
+        changed = False
+        for label, reserve in self.wraps:
+            width = max(160, visible - reserve)
+            if pixels(label.cget("wraplength")) != width:
+                label.configure(wraplength=width)
+                changed = True
+        if changed:
+            self.area.refit()
 
     def browse(self):
         path = self.app.choose_login_file(self)
