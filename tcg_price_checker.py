@@ -99,6 +99,7 @@ POS_MARK = re.compile(r"\(\s*POS\s*\)", re.I)  # shopfront marker; can appear an
 TAG_ORDER = {"URGENT": 0, "DRIFTING": 1, "CHECK MATCH": 2, "OK": 3, "SELF-PRICED": 4, "NO PRICE": 5,
              "NO MATCH": 6, "NO PRICE SOURCE": 7, "NO DATA": 8}
 NEED_UPDATE = ("URGENT", "DRIFTING")  # rows whose price should change
+RULE_TAGS = ("URGENT", "DRIFTING", "OK")  # rows with a trusted TCGplayer price: these get a suggested price
 INDEX_VERSION = 1
 SINGLES_VERSION = 1
 # card conditions as Shopify variants spell them -> our short codes (tcgcsv prices are Near Mint)
@@ -124,6 +125,15 @@ DEFAULT_SETTINGS = {
     "auto_match_max_diff_pct": 75,
     # sets released this recently (and presale items) are flagged fast-moving: tcgcsv is a daily snapshot
     "new_release_days": 30,
+    # pricing rules for the suggested price, by how long a listing has been in stock ("date in": the Shopify
+    # listing date, or the date received set by hand). Prices only ever change when an operator sends them.
+    "rules_new_margin_pct": 25,   # in stock under rules_mid_years: market price, but keep at least this margin
+    "rules_mid_years": 1,
+    "rules_mid_margin_pct": 15,   # from rules_mid_years until stale: market price, keep at least this margin
+    "stale_years": 2,             # stale from here: just under market, even at a loss
+    "stale_under_market": 0.05,   # stale: this many dollars under the market price
+    "round_99": True,             # end suggested prices in .99 when that's a small step (round_99_max_pct)
+    "round_99_max_pct": 5,
     # TCGplayer games to match against (tcgcsv category ids)
     "tcg_categories": [1, 2, 3, 85, 68, 79, 86, 90, 21, 66, 71, 89, 76, 91, 93, 62, 63, 80, 81],
     # singles: price-check TCG single cards too (matched to TCGplayer cards by set code, name and number)
@@ -943,7 +953,7 @@ class ShopifyReader:
     LEVEL = 'location { name } quantities(names: ["available"]) { quantity }'
     PAGE_LEVELS = "inventoryLevels(first: 20) { nodes { " + LEVEL + " } }"
     BULK_LEVELS = "inventoryLevels { edges { node { " + LEVEL + " } } }"
-    PRODUCT = "product { id title status tags productType }"
+    PRODUCT = "product { id title status tags productType createdAt }"
 
     def __init__(self, store, token, progress=None, use_bulk=True):
         self.url = f"https://{store}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
@@ -989,7 +999,7 @@ class ShopifyReader:
         inner = " ".join(f for f, on in ((self.COST, self.cost),
                                          (self.BULK_LEVELS if bulk else self.PAGE_LEVELS, self.levels)) if on)
         item = f"inventoryItem {{ {inner} }}" if inner else ""
-        return f"id title price compareAtPrice sku inventoryQuantity {self.PRODUCT} {item}"
+        return f"id title price compareAtPrice sku inventoryQuantity createdAt {self.PRODUCT} {item}"
 
     def _record(self, v, levels):
         p = v.get("product") or {}
@@ -1014,6 +1024,8 @@ class ShopifyReader:
             "status": p.get("status", ""),
             "type": p.get("productType") or "",
             "tags": ", ".join(p.get("tags") or []),
+            # when the listing was created in Shopify: the default "date in" for how long it's been in stock
+            "created": (v.get("createdAt") or p.get("createdAt") or "")[:10],
         }
 
     # ---------------------------------------------------------------- full / changed reads
@@ -1440,6 +1452,85 @@ def set_live_price(config, title, variant, price):
                                       "price": price, "entered": dt.datetime.now(dt.timezone.utc).isoformat()})
 
 
+def stock_date_lookup(config):
+    """{(title, variant): entry} for dates received / stale marks set by hand. (POS) and case are ignored."""
+    return {(normalize_title(e["shopify_title"]), (e.get("variant") or "").lower()): e
+            for e in config.get("stock_dates", [])}
+
+
+def set_stock_date(config, title, variant, received=None, stale=None):
+    """Save the date received (YYYY-MM-DD) and/or a stale mark (True / False) for one listing.
+    None leaves that part automatic (Shopify listing date / stale by age)."""
+    key = (normalize_title(title), (variant or "").lower())
+    config["stock_dates"] = [e for e in config.get("stock_dates", [])
+                             if (normalize_title(e["shopify_title"]), (e.get("variant") or "").lower()) != key]
+    entry = {"shopify_title": POS_MARK.sub("", title).strip(), "variant": variant or ""}
+    if received:
+        entry["received"] = received
+    if stale is not None:
+        entry["stale"] = bool(stale)
+    if "received" in entry or "stale" in entry:
+        config["stock_dates"].append(entry)
+
+
+def age_text(days):
+    """'2y 3m', '5m', '12d' for a number of days in stock."""
+    if days is None:
+        return ""
+    if days < 31:
+        return f"{days}d"
+    months = int(days / 30.44)
+    return f"{months // 12}y {months % 12}m" if months >= 12 else f"{months}m"
+
+
+def ends_in_99(price, floor=None, allow_up=True, max_pct=5):
+    """The nearest price ending in .99 (41.37 -> 40.99), if that's within max_pct of the price, not under
+    the floor, and (allow_up=False) not above the price. Otherwise the price unchanged."""
+    if price < 1.5:
+        return price  # too cheap for .99 to mean anything
+    cents = round(price * 100)
+    down = (cents + 1) // 100 * 100 - 1          # largest x.99 at or below the price
+    up = -(-(cents + 1) // 100) * 100 - 1          # smallest x.99 at or above the price
+    options = [c / 100 for c in ([down, up] if allow_up else [down])
+               if c > 0 and abs(c - cents) <= cents * max_pct / 100 and (floor is None or c / 100 >= floor - 1e-9)]
+    return min(options, key=lambda v: abs(v - price)) if options else price
+
+
+def rule_price(market, cost, age_days, stale, s):
+    """Suggested price under the pricing rules, and the reason. market = TCGplayer price (for singles already
+    adjusted for condition). Over stale_years: just under market, even at a loss. Younger: market price, but
+    never below the margin for its age band (raised above market if needed)."""
+    if not market:
+        return None, ""
+    round99 = s.get("round_99", True)
+    max_pct = s.get("round_99_max_pct", 5)
+    if stale:
+        under = float(s.get("stale_under_market", 0.05))
+        target = max(market - under, 0.01)
+        price = ends_in_99(target, None, allow_up=False, max_pct=max_pct) if round99 else target
+        note = f"stale: {money(under)} under market, even below cost"
+        if cost and price < cost:
+            note += f" ({money(cost - price)} under cost)"
+        return round(price, 2), note
+    mid_years = float(s.get("rules_mid_years", 1))
+    stale_years = float(s.get("stale_years", 2))
+    if age_days is not None and age_days >= mid_years * 365.25:
+        m, band = float(s.get("rules_mid_margin_pct", 15)), f"in stock {mid_years:g}–{stale_years:g} years"
+    else:
+        m = float(s.get("rules_new_margin_pct", 25))
+        band = f"in stock under {mid_years:g} year{'s' if mid_years != 1 else ''}" if age_days is not None else "date in unknown"
+    floor = cost / (1 - m / 100) if cost and m < 100 else None
+    target = max(market, floor or 0)
+    price = ends_in_99(target, floor, allow_up=True, max_pct=max_pct) if round99 else target
+    if not cost:
+        note = f"{band}: market price (no cost in Shopify, so the {m:g}% margin isn't checked)"
+    elif floor > market:
+        note = f"{band}: raised above market ({money(market)}) to keep a {m:g}% margin"
+    else:
+        note = f"{band}: market price, keeping at least a {m:g}% margin"
+    return round(price, 2), note
+
+
 def margin(price, cost):
     """Gross margin as % of price, or None when either is unknown."""
     return (price - cost) / price * 100 if price and cost else None
@@ -1566,6 +1657,9 @@ def build_rows(config, shopify_items, index, progress=None, tcg_updated="", memo
     for e in config.get("live_prices", []):
         live_by.setdefault((normalize_title(e["shopify_title"]), (e.get("variant") or "").lower()), []).append(e)
     cond_pct = settings.get("condition_pct") or DEFAULT_SETTINGS["condition_pct"]
+    dates = stock_date_lookup(config)
+    today = dt.date.today()
+    stale_days = float(settings.get("stale_years", 2)) * 365.25
 
     listings = []
     for item in shopify_items:
@@ -1701,6 +1795,16 @@ def build_rows(config, shopify_items, index, progress=None, tcg_updated="", memo
             if kind == "single":
                 source += (f", {'/'.join(f for f in finishes if f)}"
                            + (f", × {factor * 100:g}% for {CONDITIONS[condition]}" if condition != "NM" else ""))
+        # how long it's been in stock: the date received set by hand, else when the Shopify listing was created
+        mark = dates.get((normalize_title(item["title"]), (item["variant"] or "").lower())) or {}
+        date_in = mark.get("received") or item.get("created") or ""
+        try:
+            age_days = max((today - dt.date.fromisoformat(date_in)).days, 0) if date_in else None
+        except ValueError:
+            age_days = None
+        stale = mark["stale"] if "stale" in mark else (age_days is not None and age_days >= stale_days)
+        suggested, suggest_note = (rule_price(market, cost, age_days, stale, settings)
+                                   if tag in RULE_TAGS else (None, ""))
         note = override.get("note", "")
         if kind == "single" and info["language"] != "english" and refs:
             note = (note + " · " if note else "") + (
@@ -1742,8 +1846,17 @@ def build_rows(config, shopify_items, index, progress=None, tcg_updated="", memo
             "finish": " | ".join(f for f in finishes if f),
             "diff_amt": diff_amt,
             "diff_pct": diff,
-            # what our price should become: the TCGplayer price (condition-adjusted for singles)
-            "suggested_price": round(market, 2) if tag in NEED_UPDATE and market else None,
+            # what our price should become under the pricing rules (see rule_price); an operator decides
+            "suggested_price": suggested,
+            "suggest_note": suggest_note,
+            # our price is off the suggested price by at least the drifting threshold
+            "rule_change": bool(suggested and ours and abs(ours - suggested) / suggested * 100
+                                >= settings.get("drift_pct", 3)),
+            "date_in": date_in,
+            "date_in_source": "set by hand" if mark.get("received") else ("Shopify listing date" if date_in else ""),
+            "age_days": age_days,
+            "stale": bool(stale),
+            "stale_set": mark.get("stale"),
             "presale": presale,
             "release": next((r["release"] for r in refs if r.get("release")), ""),
             # presale / just released: TCGplayer prices can move a lot between daily snapshots
@@ -1833,7 +1946,7 @@ class PriceChecker:
             saved = json.loads(path.read_text(encoding="utf-8"))
             full_at, fetched_at = parse_time(saved["full_at"]), parse_time(saved["fetched_at"])
             fresh = (saved.get("store") == creds[0] and full_at.astimezone().date() == now.astimezone().date()
-                     and all(i.get("variant_id") for i in saved["items"]))
+                     and all(i.get("variant_id") and "created" in i for i in saved["items"]))
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             saved, fresh = None, False
         if fresh:
@@ -1890,6 +2003,9 @@ class PriceChecker:
             r.setdefault("product_id", None)
             r.setdefault("variant_id", None)
             r.setdefault("suggested_price", None)
+            for k, v in (("suggest_note", ""), ("rule_change", False), ("date_in", ""), ("date_in_source", ""),
+                         ("age_days", None), ("stale", False), ("stale_set", None)):
+                r.setdefault(k, v)
             r.setdefault("condition", "")
             r.setdefault("finish", "")
         self.regroup_stock()
@@ -2054,7 +2170,8 @@ class PriceChecker:
 # ---------------------------------------------------------------- output
 
 CSV_COLUMNS = ["tag", "presale", "release", "channel", "kind", "shopify_title", "variant", "type", "condition",
-               "finish", "our_price", "suggested_price", "cost", "margin_pct", "tcg_price", "tcg_margin_pct",
+               "finish", "our_price", "suggested_price", "suggest_note", "date_in", "age_days", "stale", "cost",
+               "margin_pct", "tcg_price", "tcg_margin_pct",
                "below_cost", "diff_amt", "diff_pct", "tcg_low", "match", "match_score", "tcg_name", "tcg_set", "source",
                "price_as_of", "snapshot_price", "live_entered", "fast_moving", "status", "stock", "note"]
 
@@ -2098,10 +2215,11 @@ def write_html(rows, path, settings, report_date, tcg_updated, locations=(), hid
             action = "We're below TCGplayer"
         links = " ".join(f'<a href="{html.escape(u)}" target="_blank">TCGplayer</a>' for u in r["tcg_urls"][:1])
         diff_cls = "" if r["diff_pct"] is None else ("up" if r["diff_pct"] > 0 else "down")
-        body.append(f"""<tr class="row-{tag_class(r['tag'])} row-{r.get('kind', 'sealed')}{' row-needupdate' if r['tag'] in NEED_UPDATE else ''}{' row-presale' if r['presale'] else ''}{' row-belowcost' if r['below_cost'] else ''}{' row-fast' if r['fast_moving'] else ''}">
-  <td><span class="tag t-{tag_class(r['tag'])}">{r['tag']}</span>{' <span class="tag t-presale">PRESALE</span>' if r['presale'] else ''}{' <span class="tag t-fast" title="Price can move a lot between daily snapshots - check live">⚡ FAST-MOVING</span>' if r['fast_moving'] else ''}</td>
+        body.append(f"""<tr class="row-{tag_class(r['tag'])} row-{r.get('kind', 'sealed')}{' row-needupdate' if r['tag'] in NEED_UPDATE else ''}{' row-presale' if r['presale'] else ''}{' row-belowcost' if r['below_cost'] else ''}{' row-fast' if r['fast_moving'] else ''}{' row-stale' if r.get('stale') else ''}">
+  <td><span class="tag t-{tag_class(r['tag'])}">{r['tag']}</span>{' <span class="tag t-presale">PRESALE</span>' if r['presale'] else ''}{' <span class="tag t-fast" title="Price can move a lot between daily snapshots - check live">⚡ FAST-MOVING</span>' if r['fast_moving'] else ''}{' <span class="tag t-stale" title="In stock past the stale age: priced to market even at a loss">⌛ STALE</span>' if r.get('stale') else ''}</td>
   <td><div class="title">{html.escape(r['shopify_title'])}{(' — ' + html.escape(r['variant'])) if r['variant'] else ''}</div>
-      <div class="sub">{r['channel']} · {html.escape(r['type'])}{(' · ' + html.escape(extra)) if extra else ''}</div>
+      <div class="sub">{r['channel']} · {html.escape(r['type'])}{(' · ' + html.escape(extra)) if extra else ''}{(' · in since ' + r['date_in'] + ' (' + age_text(r.get('age_days')) + ')') if r.get('date_in') else ''}</div>
+      {f'<div class="sub">suggested {money(r["suggested_price"])}: {html.escape(r.get("suggest_note") or "")}</div>' if r.get('suggested_price') else ''}
       {f'<div class="sub">{html.escape(r["note"])}</div>' if r['note'] else ''}</td>
   <td class="num">{money(r['our_price'])}{f'<div class="sub">was {money(r["compare_at"])}</div>' if r['compare_at'] else ''}</td>
   <td class="num">{money(r['cost'])}{f'<div class="sub">margin {r["margin_pct"]:.0f}%</div>' if r['margin_pct'] is not None else ''}</td>
@@ -2145,7 +2263,7 @@ th{{font-size:12px;color:var(--muted);font-weight:600;position:sticky;top:0;back
 .tag{{display:inline-block;font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;margin:0 4px 4px 0;white-space:nowrap}}
 .t-urgent{{background:var(--redbg);color:var(--red)}} .t-drifting{{background:var(--amberbg);color:var(--amber)}}
 .t-ok{{background:var(--greenbg);color:var(--green)}} .t-nodata,.t-selfpriced,.t-nomatch,.t-noprice{{background:var(--greybg);color:var(--grey)}}
-.t-presale,.t-fast{{background:var(--bluebg);color:var(--blue)}} .t-checkmatch{{background:var(--bluebg);color:var(--blue);outline:1px dashed var(--blue)}}
+.t-presale,.t-fast{{background:var(--bluebg);color:var(--blue)}} .t-stale{{background:var(--amberbg);color:var(--amber)}} .t-checkmatch{{background:var(--bluebg);color:var(--blue);outline:1px dashed var(--blue)}}
 a{{color:var(--blue)}}
 </style></head><body><main>
 <h1>Shopify vs TCGplayer — {report_date}</h1>
@@ -2153,7 +2271,7 @@ a{{color:var(--blue)}}
 Drifting ≥ {settings['drift_pct']}% / Urgent ≥ {settings['urgent_pct']}% (presale: {settings['presale_drift_pct']}% / {settings['presale_urgent_pct']}%) ·
 Singles: TCGplayer Near Mint price × condition ({", ".join(f"{k} {v:g}%" for k, v in (settings.get("condition_pct") or {}).items())}) · Stock = Shopify available quantity, per location</div>{notes_html}
 <div class="cards">{cards}<div class="card"><b style="color:var(--blue)">{presale_count}</b>Presale</div></div>
-<div class="filters"><button class="on" data-f="all">All ({len(rows)})</button><button data-f="needupdate">Need update ({need_count})</button>{buttons}<button data-f="sealed">Sealed ({kinds['sealed']})</button><button data-f="single">Singles ({kinds['single']})</button><button data-f="presale">Presale</button><button data-f="belowcost">TCGplayer below our cost</button><button data-f="fast">⚡ Fast-moving</button></div>
+<div class="filters"><button class="on" data-f="all">All ({len(rows)})</button><button data-f="needupdate">Need update ({need_count})</button>{buttons}<button data-f="sealed">Sealed ({kinds['sealed']})</button><button data-f="single">Singles ({kinds['single']})</button><button data-f="presale">Presale</button><button data-f="belowcost">TCGplayer below our cost</button><button data-f="fast">⚡ Fast-moving</button><button data-f="stale">⌛ Stale ({sum(1 for r in rows if r.get('stale'))})</button></div>
 <input class="search" type="search" placeholder="Search products…" aria-label="Search products">
 <div class="wrap"><table>
 <thead><tr><th>Tag</th><th>Shopify product</th><th class="num">Our price</th><th class="num">Cost</th><th class="num">TCGplayer</th><th class="num">Us vs TCG</th><th class="num">Stock</th>{loc_heads}<th>TCGplayer match</th></tr></thead>
@@ -2175,8 +2293,10 @@ q.oninput=apply;
 import tkinter as tk  # noqa: E402
 from tkinter import filedialog, messagebox, simpledialog, ttk  # noqa: E402
 
-FILTERS = [("All", None), ("Need update", "need_update"), ("Urgent", "URGENT"), ("Drifting", "DRIFTING"),
+FILTERS = [("All", None), ("Need update", "need_update"), ("Rule says change", "rule_change"),
+           ("Urgent", "URGENT"), ("Drifting", "DRIFTING"),
            ("Check match", "CHECK MATCH"), ("OK", "OK"), ("Presale", "presale"), ("⚡ Fast-moving", "fast_moving"),
+           ("⌛ Stale", "stale"),
            ("Below cost", "below_cost"), ("We price", "SELF-PRICED"), ("Not on TCGplayer", "NO MATCH"),
            ("No price", "NO PRICE"), ("No price source", "NO PRICE SOURCE"), ("No data", "NO DATA")]
 KINDS = {"Everything": None, "Sealed": "sealed", "Singles": "single", "Other": "other"}
@@ -2196,6 +2316,8 @@ COLUMNS = [  # id, heading, width (characters), anchor, sort key
     ("tcgmargin", "Margin at TCG", 11, "e", lambda r: r["tcg_margin_pct"] if r["tcg_margin_pct"] is not None else -1e9),
     ("diff", "Difference", 9, "e", lambda r: abs(r["diff_pct"] or 0)),
     ("amt", "$ diff", 9, "e", lambda r: abs(r["diff_amt"] or 0)),
+    ("rule", "Suggested", 9, "e", lambda r: r.get("suggested_price") or 0),
+    ("age", "Age", 7, "e", lambda r: r.get("age_days") if r.get("age_days") is not None else -1),
     ("stock", "Stock", 6, "e", lambda r: r["stock"] if isinstance(r["stock"], (int, float)) else -1e9),
     ("match", "TCGplayer product", 32, "w", lambda r: r["tcg_name"].lower()),
     ("how", "Match", 10, "w", lambda r: r["match"]),
@@ -2203,7 +2325,7 @@ COLUMNS = [  # id, heading, width (characters), anchor, sort key
 FLEX_COLUMNS = {"product": 0.6, "match": 0.4}  # these two share whatever width is left
 FLEX_MIN_CHARS = {"product": 24, "match": 16}
 # on narrow windows these columns hide, first to last, so product names stay readable (details stay below)
-HIDE_WHEN_NARROW = ["how", "tcgmargin", "margin", "amt", "cost", "flags", "LOCATIONS"]
+HIDE_WHEN_NARROW = ["how", "tcgmargin", "margin", "amt", "age", "cost", "flags", "LOCATIONS"]
 
 
 def short_names(names, size=9):
@@ -2221,14 +2343,19 @@ def help_text(s):
     return (f"Status: URGENT = {n(s['urgent_pct'])}%+ away from TCGplayer · DRIFTING = {n(s['drift_pct'])}%+ away "
             f"(presale items: {n(s['presale_urgent_pct'])}% / {n(s['presale_drift_pct'])}%) · CHECK MATCH = please "
             "confirm the TCGplayer product is right. Change these numbers in Settings.\n"
-            "Need update = every URGENT and DRIFTING row; the suggested new price is the TCGplayer price (for singles "
-            "adjusted for condition). NO PRICE SOURCE = TCGplayer doesn't price it (sports cards, graded "
+            "Need update = every URGENT and DRIFTING row. Suggested = the price under the pricing rules (Settings), "
+            f"by how long the listing has been in stock: under {n(s.get('rules_mid_years', 1))} year, market keeping a "
+            f"{n(s.get('rules_new_margin_pct', 25))}% margin; then market keeping {n(s.get('rules_mid_margin_pct', 15))}%; "
+            f"over {n(s.get('stale_years', 2))} years (⌛ stale), {money(s.get('stale_under_market', 0.05))} under market "
+            "even at a loss. Rule says change = our price is off the suggested price. 'Date in / stale…' sets when "
+            "a listing came in (a new shipment restarts its age) or marks it stale. NO PRICE SOURCE = TCGplayer doesn't price it (sports cards, graded "
             "slabs, accessories...). Stock = total available, then one column per store / warehouse (set in Settings). "
             "Out-of-stock listings are hidden unless 'Show out of stock' is ticked. Drag a column heading to move it.\n"
             "Select several rows (⌘/Ctrl-click or Shift-click) and press 'Update Shopify prices…' to change our prices "
             "in Shopify; nothing is sent until you confirm.\n"
             "Margin = profit as % of the price, using Shopify's cost per item. ⚠ = TCGplayer's price is below our cost.\n"
             "TCGplayer prices are a once-a-day snapshot. ★ = presale · ⚡ = fast-moving (presale or new set), check it live "
+            "· ⌛ = stale "
             "· ✎ = price typed in with 'Enter live price…'.\n"
             "Double-click a row (or press Enter) to open it on TCGplayer. Right-click for more options.\n\n"
             + ("Shortcuts: ⌘F search · ⌘R check prices again · ⌘+ / ⌘− / ⌘0 text size · Esc clears the search"
@@ -2631,6 +2758,7 @@ class App(tk.Tk):
             ("Choose a different match…", self.change_match),
             ("Enter live price…", self.enter_live_price),
             ("Update Shopify prices…", self.update_shopify_prices),
+            ("Date in / stale…", self.set_date_in),
             ("We price this ourselves", self.toggle_self_priced),
             ("Hide this product", self.hide_product),
             ("Undo my choice", self.reset_choice))]
@@ -2808,11 +2936,13 @@ class App(tk.Tk):
         amt = "" if r["diff_amt"] is None else ("+" if r["diff_amt"] > 0 else "−") + money(abs(r["diff_amt"]))
         margin = lambda m: "" if m is None else f"{m:.0f}%"
         tcg_margin = margin(r["tcg_margin_pct"]) + ("  ⚠" if r["below_cost"] else "")
-        flags = ("★" if r["presale"] else "") + ("⚡" if r["fast_moving"] else "") + ("✎" if r["live_entered"] else "")
+        flags = (("★" if r["presale"] else "") + ("⚡" if r["fast_moving"] else "") + ("⌛" if r.get("stale") else "")
+                 + ("✎" if r["live_entered"] else ""))
         at = r.get("locations")
         locs = tuple("" if at is None else at.get(n, 0) for n in self.locations)
         return (r["tag"], flags, product, money(r["our_price"]), money(r["cost"]),
                 margin(r["margin_pct"]), money(r["tcg_price"]), tcg_margin, pct(r["diff_pct"]), amt,
+                money(r.get("suggested_price")), age_text(r.get("age_days")),
                 stock_text(r["stock"])) + locs + (r["tcg_name"] or "—", r["match"])
 
     def _matches_filter(self, r, code):
@@ -2820,8 +2950,8 @@ class App(tk.Tk):
             return True
         if code == "need_update":
             return r["tag"] in NEED_UPDATE
-        if code in ("presale", "below_cost", "fast_moving"):
-            return r[code]
+        if code in ("presale", "below_cost", "fast_moving", "stale", "rule_change"):
+            return r.get(code)
         return r["tag"] == code
 
     def _search_soon(self):
@@ -2863,8 +2993,8 @@ class App(tk.Tk):
                 counts[label] += 1
             if r["tag"] in NEED_UPDATE:
                 counts["Need update"] += 1
-            for flag in ("presale", "below_cost", "fast_moving"):
-                if r[flag]:
+            for flag in ("presale", "below_cost", "fast_moving", "stale", "rule_change"):
+                if r.get(flag):
                     counts[by_code[flag]] += 1
         for label, b in self.filter_buttons.items():
             b.config(text=f"{label} ({counts[label]})" if self.checker.rows else label)
@@ -2948,8 +3078,14 @@ class App(tk.Tk):
             stock += f"  ·  ({n} rows selected)"
         parts.append(stock)
         if r.get("suggested_price"):
-            parts.append(f"Suggested new price: {money(r['suggested_price'])} (TCGplayer"
-                         + (f", {CONDITIONS.get(r['condition'], r['condition'])}" if r.get("condition") else "") + ")")
+            parts.append(f"Suggested price: {money(r['suggested_price'])}  ·  {r.get('suggest_note', '')}"
+                         + (f"  ·  for {CONDITIONS.get(r['condition'], r['condition'])}" if r.get("condition") else ""))
+        if r.get("date_in") or r.get("stale_set") is not None:
+            when = (f"In stock since {r['date_in']} ({age_text(r.get('age_days'))}, {r.get('date_in_source')})"
+                    if r.get("date_in") else "Date in unknown")
+            stale_part = {True: "  ·  ⌛ marked stale by hand", False: "  ·  marked not stale by hand"}.get(
+                r.get("stale_set"), "  ·  ⌛ stale (in stock past the stale age)" if r.get("stale") else "")
+            parts.append(when + stale_part)
         if r.get("tag") == "NO PRICE SOURCE":
             parts.append("TCGplayer doesn't price this kind of product (sports cards, graded slabs, accessories, "
                          "merchandise...), so it isn't compared.")
@@ -3137,6 +3273,12 @@ class App(tk.Tk):
             return
         PriceUpdate(self, rows, skipped=len(missing))
 
+    def set_date_in(self):
+        """Set when the selected listing(s) came in (e.g. a new shipment or reprint), or mark them stale."""
+        rows = self._selected_rows()
+        if rows and not self.busy:
+            StockDate(self, rows)
+
     def toggle_self_priced(self):
         r = self._selected()
         if not r:
@@ -3221,7 +3363,8 @@ class PriceUpdate(tk.Toplevel):
         f = ttk.Frame(self, padding=14)
         f.pack(fill="both", expand=True)
         intro = (f"{len(rows)} listing{'s' if len(rows) != 1 else ''} selected. Check the new price for each one; "
-                 "it starts at the suggested price (TCGplayer). Clear a box or leave our price to skip that listing.\n"
+                 "it starts at the suggested price (pricing rules by age). The 'vs cost' column shows how each new "
+                 "price compares with cost. Clear a box or leave our price to skip that listing.\n"
                  "Nothing changes in Shopify until you press Send and confirm.")
         if skipped:
             intro += f"\n{skipped} selected row(s) can't be changed from here (no Shopify link); run a fresh check first."
@@ -3241,7 +3384,7 @@ class PriceUpdate(tk.Toplevel):
         area = ScrollArea(f, width=820, height=min(32 * (len(rows) + 1), 420))
         area.pack(fill="both", expand=True)
         grid = area.inner
-        for c, head in enumerate(("Product", "Our price", "TCGplayer", "Cost", "New price", "Change")):
+        for c, head in enumerate(("Product", "Our price", "TCGplayer", "Cost", "New price", "vs cost")):
             ttk.Label(grid, text=head, font=app.fonts["bold"]).grid(row=0, column=c, sticky="w", padx=6, pady=(0, 4))
         self.entries, self.changes = [], []
         for i, r in enumerate(rows, 1):
@@ -3251,7 +3394,7 @@ class PriceUpdate(tk.Toplevel):
                 ttk.Label(grid, text=money(v) or "—").grid(row=i, column=c, sticky="e", padx=6)
             var = tk.StringVar(value=f"{target_price(r):.2f}" if target_price(r) else "")
             ttk.Entry(grid, textvariable=var, width=9, justify="right").grid(row=i, column=4, padx=6, pady=1)
-            change = ttk.Label(grid, text="", width=16)
+            change = ttk.Label(grid, text="", width=44)  # wide enough for "−$x under cost (y% margin) · stale, allowed"
             change.grid(row=i, column=5, sticky="w", padx=6)
             var.trace_add("write", lambda *_, r=r, v=var, l=change: self._show_change(r, v, l))
             self._show_change(r, var, change)
@@ -3266,18 +3409,31 @@ class PriceUpdate(tk.Toplevel):
         return float(text) if text else None
 
     def _show_change(self, r, var, label):
+        """How the typed new price compares with cost: profit in dollars and as a margin of the new price."""
         try:
             new = self._parse(var.get())
         except ValueError:
             label.config(text="not a price", foreground=self.app.colors["warn"])
             return
-        if new is None or r["our_price"] is None or round(new, 2) == round(r["our_price"], 2):
-            label.config(text="no change", foreground=self.app.colors["muted"])
+        if new is None:
+            label.config(text="skipped", foreground=self.app.colors["muted"])
             return
-        pct_change = (new - r["our_price"]) / r["our_price"] * 100 if r["our_price"] else 0
-        warn = " ⚠ below cost" if r["cost"] and new < r["cost"] else ""
-        label.config(text=f"{pct_change:+.1f}%{warn}",
-                     foreground=self.app.colors["warn"] if warn or abs(pct_change) >= 50 else self.app.colors["text"])
+        unchanged = r["our_price"] is not None and round(new, 2) == round(r["our_price"], 2)
+        tail = " · no change" if unchanged else ""
+        if not r["cost"]:
+            label.config(text="no cost in Shopify" + tail, foreground=self.app.colors["muted"])
+            return
+        profit = new - r["cost"]
+        m = profit / new * 100 if new else 0
+        if abs(profit) < 0.005:
+            text, warn = "at cost", not r.get("stale")
+        elif profit > 0:
+            text, warn = f"+{money(profit)} over cost ({m:.0f}% margin)", False
+        else:
+            text, warn = f"−{money(-profit)} under cost ({m:.0f}% margin)", not r.get("stale")
+            text += " · stale, allowed" if r.get("stale") else " ⚠"
+        label.config(text=text + tail, foreground=self.app.colors["warn"] if warn else
+                     (self.app.colors["muted"] if unchanged else self.app.colors["text"]))
 
     def fill_suggested(self):
         for r, var in zip(self.rows, self.entries):
@@ -3313,8 +3469,13 @@ class PriceUpdate(tk.Toplevel):
                  f"{money(r['our_price'])} → {money(p)}" for r, p in changes[:15]]
         if len(changes) > 15:
             lines.append(f"…and {len(changes) - 15} more")
-        below = sum(1 for r, p in changes if r["cost"] and p < r["cost"])
-        warn = f"\n\n⚠ {below} of these would be below our cost." if below else ""
+        below = [r for r, p in changes if r["cost"] and p < r["cost"]]
+        stale_below = sum(1 for r in below if r.get("stale"))
+        warn = ""
+        if below:
+            warn = f"\n\n⚠ {len(below)} of these would be below our cost"
+            warn += (f" ({stale_below} stale: allowed by the {self.app.checker.config['settings'].get('stale_years', 2):g}-year rule)."
+                     if stale_below else ".")
         if not messagebox.askyesno(
                 "Send to Shopify?", f"Change {len(changes)} price{'s' if len(changes) != 1 else ''} in Shopify? "
                 "This changes the live price customers see (online and in the stores' POS).\n\n"
@@ -3336,6 +3497,83 @@ class PriceUpdate(tk.Toplevel):
 
         app.run_in_background("Sending prices to Shopify…",
                                lambda progress: app.checker.push_prices(changes, progress), done)
+
+
+class StockDate(tk.Toplevel):
+    """Set the date received for listings (a new shipment or reprint restarts their age), or mark them stale."""
+
+    def __init__(self, app, rows):
+        super().__init__(app)
+        self.app, self.rows = app, rows
+        self.title("Date in / stale")
+        self.transient(app)
+        self.resizable(False, False)
+        s = app.checker.config["settings"]
+        f = ttk.Frame(self, padding=16)
+        f.pack(fill="both", expand=True)
+        first = rows[0]
+        name = first["shopify_title"] + (f" — {first['variant']}" if first["variant"] else "")
+        head = name if len(rows) == 1 else f"{len(rows)} listings selected (first: {name})"
+        ttk.Label(f, text=head[:110], font=app.fonts["bold"]).grid(row=0, column=0, columnspan=3, sticky="w")
+        now = (f"Now: in stock since {first['date_in']} ({age_text(first.get('age_days'))}, {first.get('date_in_source')})"
+               if first.get("date_in") else "Now: date in unknown")
+        ttk.Label(f, text=now, foreground=app.colors["muted"]).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        ttk.Label(f, text="Date received (YYYY-MM-DD):").grid(row=2, column=0, sticky="w")
+        mark = stock_date_lookup(app.checker.config).get((normalize_title(first["shopify_title"]),
+                                                          (first["variant"] or "").lower())) or {}
+        self.received = tk.StringVar(value=mark.get("received", ""))
+        ttk.Entry(f, textvariable=self.received, width=12).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Button(f, text="Today", command=lambda: self.received.set(dt.date.today().isoformat())).grid(
+            row=2, column=2, sticky="w")
+        ttk.Label(f, text="Set this when a new shipment or reprint comes in: it restarts the age. Leave empty "
+                          "to use the date the listing was created in Shopify.", foreground=app.colors["faint"],
+                  wraplength=460, justify="left").grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        ttk.Label(f, text="Stale:").grid(row=4, column=0, sticky="w")
+        self.stale = tk.StringVar(value={True: "yes", False: "no"}.get(mark.get("stale"), "auto"))
+        self.start_received, self.start_stale = self.received.get(), self.stale.get()
+        box = ttk.Frame(f)
+        box.grid(row=4, column=1, columnspan=2, sticky="w")
+        for value, text in (("auto", f"By age ({s.get('stale_years', 2):g}+ years)"), ("yes", "Stale now"),
+                            ("no", "Not stale")):
+            ttk.Radiobutton(box, text=text, value=value, variable=self.stale).pack(side="left", padx=(0, 10))
+        ttk.Label(f, text=f"Stale listings are suggested at {money(s.get('stale_under_market', 0.05))} under market, "
+                          "even below cost. Prices still only change when you send them with 'Update Shopify prices'.",
+                  foreground=app.colors["faint"], wraplength=460, justify="left").grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(4, 12))
+        buttons = ttk.Frame(f)
+        buttons.grid(row=6, column=0, columnspan=3, sticky="e")
+        ttk.Button(buttons, text="Save", command=self.save).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="left")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.save())
+
+    def save(self):
+        received = self.received.get().strip()
+        if received:
+            try:
+                day = dt.date.fromisoformat(received)
+            except ValueError:
+                messagebox.showerror("Date in", f"'{received}' isn't a date. Use YYYY-MM-DD, e.g. "
+                                     f"{dt.date.today().isoformat()}.", parent=self)
+                return
+            if day > dt.date.today():
+                messagebox.showerror("Date in", "The date received can't be in the future.", parent=self)
+                return
+        stale = {"yes": True, "no": False}.get(self.stale.get())
+        config = self.app.checker.config
+        marks = stock_date_lookup(config)
+        for r in self.rows:
+            # with several rows selected, a part left as it was keeps each listing's own value
+            own = marks.get((normalize_title(r["shopify_title"]), (r["variant"] or "").lower())) or {}
+            row_received = received if received != self.start_received else own.get("received", received)
+            row_stale = stale if self.stale.get() != self.start_stale else own.get("stale", stale)
+            set_stock_date(config, r["shopify_title"], r["variant"], row_received or None, row_stale)
+        self.app.checker.save()
+        sel = self.app.tree.selection()
+        for title in dict.fromkeys(r["shopify_title"] for r in self.rows):
+            self.app.checker.recompute_title(title)
+        self.destroy()
+        self.app.refresh_table(fallback_index=int(sel[0]) if sel else None)
 
 
 class MatchPicker(tk.Toplevel):
@@ -3543,6 +3781,33 @@ class Settings(tk.Toplevel):
 
         ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=10)
         r += 1
+        ttk.Label(f, text="Pricing rules for the suggested price (by how long a listing has been in stock)",
+                  font=app.fonts["bold"]).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        for key, label, top, step in [
+                ("rules_new_margin_pct", "Newer stock: keep at least this % margin", 95, 1),
+                ("rules_mid_years", "…until it has been in stock this many years", 20, 0.5),
+                ("rules_mid_margin_pct", "Then keep at least this % margin", 95, 1),
+                ("stale_years", "Stale after this many years (priced to market even at a loss)", 20, 0.5),
+                ("stale_under_market", "Stale: this many dollars under market", 100, 0.05)]:
+            self._wrap(ttk.Label(f, text=label), 330).grid(row=r, column=0, sticky="w", pady=3)
+            v = tk.StringVar(value=f"{float(s.get(key, DEFAULT_SETTINGS[key])):g}")
+            ttk.Spinbox(f, from_=0, to=top, increment=step, textvariable=v, width=6).grid(row=r, column=1, sticky="w")
+            self.vars[key] = v
+            r += 1
+        self.round99 = tk.BooleanVar(value=s.get("round_99", True))
+        ttk.Checkbutton(f, text=f"End suggested prices in .99 when that's within {s.get('round_99_max_pct', 5):g}% "
+                                "(never under the margin; stale prices only round down)",
+                        variable=self.round99).grid(row=r, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        r += 1
+        self._wrap(ttk.Label(f, text="Date in = the date received set with 'Date in / stale…', else the date the "
+                                     "listing was created in Shopify. Nothing is changed in Shopify automatically.",
+                             foreground=app.colors["faint"], justify="left"), 40).grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        r += 1
+
+        ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=10)
+        r += 1
         self._wrap(ttk.Label(f, text="Sealed product types (matched to TCGplayer sealed products):"), 40).grid(
             row=r, column=0, columnspan=3, sticky="w")
         r += 1
@@ -3646,9 +3911,21 @@ class Settings(tk.Toplevel):
                 s[key] = float(self.vars[key].get())
             s["new_release_days"] = int(float(self.vars["new_release_days"].get()))
             s["condition_pct"] = {code: float(v.get()) for code, v in self.cond_vars.items()}
+            rules = {key: float(self.vars[key].get()) for key in
+                     ("rules_new_margin_pct", "rules_mid_years", "rules_mid_margin_pct", "stale_years",
+                      "stale_under_market")}
         except ValueError:
-            messagebox.showerror("Settings", "The percentages must be numbers.", parent=self)
+            messagebox.showerror("Settings", "The percentages and pricing-rule numbers must be numbers.", parent=self)
             return
+        if not (0 <= rules["rules_new_margin_pct"] < 100 and 0 <= rules["rules_mid_margin_pct"] < 100):
+            messagebox.showerror("Settings", "Margins must be between 0 and 99%.", parent=self)
+            return
+        if not 0 < rules["rules_mid_years"] <= rules["stale_years"]:
+            messagebox.showerror("Settings", "The years for the second margin must be above 0 and no more than "
+                                 "the stale age.", parent=self)
+            return
+        s.update(rules)
+        s["round_99"] = self.round99.get()
         columns = []
         for line in self.stock_text.get("1.0", "end").splitlines():
             if not line.strip():

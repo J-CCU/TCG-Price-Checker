@@ -49,8 +49,18 @@ or run the script with Python.
   - `NO MATCH`: no TCGplayer product found (shown under the "Not on TCGplayer" filter)
   - `NO PRICE SOURCE`: a kind of product TCGplayer doesn't price (see Other above)
   - `NO DATA`: the Shopify listing has no price
-- "Need update": every URGENT and DRIFTING row, with the suggested new price (the TCGplayer price; for
-  singles adjusted for condition). In the window, the HTML report, and `need_update_<date>.csv`.
+- "Need update": every URGENT and DRIFTING row, with the suggested new price. In the window, the HTML
+  report, and `need_update_<date>.csv`.
+- Suggested price, from pricing rules based on how long a listing has been in stock (see
+  [Pricing rules](#pricing-rules-suggested-price)): under 1 year, the TCGplayer price but never under a 25%
+  margin; 1-2 years, the same with a 15% margin; over 2 years (stale), 5 cents under market even at a loss;
+  ending in .99 where that's a small step. Every OK, DRIFTING and URGENT row gets one. "Rule says change"
+  lists the rows whose price is off it. It is only a suggestion: prices change only when an operator sends
+  them with "Update Shopify prices...".
+- Date in and staleness: each listing's "date in" is the day it was created in Shopify, or a date received
+  set by hand with "Date in / stale..." (set one when a new shipment or reprint comes in: it restarts the
+  age). Age column, stale flag (hourglass) and "Stale" filter; a listing can also be marked stale (or not
+  stale) by hand.
 - Stock: one column per store / warehouse plus their total, in the window and the reports, so every store
   can see what the others hold. Columns are set in Settings (`stock_columns`): by default Warehouse (Cash
   Cards Unlimited Warehouse + Relics Awakened), Frank and Son, Janss and Woodland Hills. Shopify locations
@@ -61,7 +71,7 @@ or run the script with Python.
 - Columns can be dragged to a new place; the order is remembered. Right-click a heading to reset it.
 - Out-of-stock listings (stock 0 or blank) are hidden by default in the window and the reports; "Show out
   of stock" (or `--show-zero`) brings them back. The report says how many were left out.
-- Flags: presale, fast-moving (presale or set released recently), TCGplayer price below our cost.
+- Flags: presale, fast-moving (presale or set released recently), stale, TCGplayer price below our cost.
 - Cost and margin from Shopify's "Cost per item": our margin, and the margin if priced at TCGplayer.
 - Separate drift / urgent thresholds for presale items.
 - Choice of TCGplayer Market Price or lowest listing as the comparison price.
@@ -164,19 +174,21 @@ python3 tcg_price_checker.py --cli [--credentials PATH] [--shopify-csv EXPORT.cs
 | Settings | Thresholds, comparison price, product types, word lists, stock columns, login file, text size. |
 | Export this list... | Save the rows currently shown (current filter, kind, stock toggle and search) as CSV, with every location's stock. Choose "Need update" first to export just the rows whose price should change. |
 | Help | Explains statuses, symbols and shortcuts. |
-| Filter buttons | All, Need update (Urgent + Drifting), Urgent, Drifting, Check match, OK, Presale, Fast-moving, Below cost, We price, Not on TCGplayer, No price, No price source, No data. Each shows its count. |
+| Filter buttons | All, Need update (Urgent + Drifting), Rule says change (our price is off the suggested price by the drifting % or more), Urgent, Drifting, Check match, OK, Presale, Fast-moving, Stale, Below cost, We price, Not on TCGplayer, No price, No price source, No data. Each shows its count. |
 | Show | Everything, Sealed, Singles or Other (no price source). |
 | Show out of stock | Off by default: listings with stock 0 or blank are hidden. The status line says how many. |
 
 Table columns: Status, Flags, Shopify product (title and variant), Our price, Cost, Our margin, TCG market
-(or TCG lowest), Margin at TCG, Difference, $ diff, Stock (total of the stock columns), one column per
+(or TCG lowest), Margin at TCG, Difference, $ diff, Suggested (price under the pricing rules), Age (time in
+stock since the date in), Stock (total of the stock columns), one column per
 stock column (see `stock_columns`), TCGplayer product, Match. Drag a heading to move a column; right-click
 a heading for "Reset column order". The order is saved when the window closes. On a narrow window the less important columns hide first
-(Match, Margin at TCG, Our margin, $ diff, Cost, Flags, then the location columns); the details under the
-table always show everything, including the suggested new price and each stock column.
+(Match, Margin at TCG, Our margin, $ diff, Age, Cost, Flags, then the location columns); the details under the
+table always show everything, including the suggested price with the rule that set it, the date in, and
+each stock column.
 
 Long lists are drawn in batches so the window stays usable, and the search waits for a pause in typing.
-| Row actions (buttons or right-click) | Open on TCGplayer, Match is correct, Choose a different match..., Enter live price..., Update Shopify prices..., We price this ourselves, Hide this product, Undo my choice. |
+| Row actions (buttons or right-click) | Open on TCGplayer, Match is correct, Choose a different match..., Enter live price..., Update Shopify prices..., Date in / stale..., We price this ourselves, Hide this product, Undo my choice. |
 
 Select several rows with Cmd/Ctrl+click or Shift+click. The other actions use the last row clicked.
 
@@ -184,8 +196,10 @@ Select several rows with Cmd/Ctrl+click or Shift+click. The other actions use th
 
 1. Select the rows to change (for example in "Need update"), then click "Update Shopify prices...".
 2. Each listing starts at its suggested price (else the TCGplayer price). Type a different price, or
-   "Keep our prices" / "Use suggested prices" for all. The Change column shows the % change, and warns when
-   a price is below cost or 50%+ away. Rows left at our price are skipped.
+   "Keep our prices" / "Use suggested prices" for all. The "vs cost" column compares the price in the box
+   with cost as you type: profit in dollars and the margin it gives (`+$6.91 over cost (33% margin)`,
+   `at cost`, `-$2.18 under cost (-22% margin)`). Under cost is flagged with a warning sign, unless the
+   listing is stale (`stale, allowed`). Rows left at our price are skipped.
 3. "Send to Shopify..." shows the full list of changes and asks again before anything is sent. The price
    changes everywhere the listing is sold (online and POS).
 4. The list updates straight away. Every attempt, changed or failed, is added to
@@ -194,8 +208,40 @@ Select several rows with Cmd/Ctrl+click or Shift+click. The other actions use th
 This needs the Shopify app to have the `write_products` permission. Rows from a Shopify CSV export
 (`--shopify-csv`) can't be updated.
 
+### Pricing rules (suggested price)
+
+The suggested price depends on how long the listing has been in stock, counted from its date in. All the
+numbers are in Settings > Pricing rules.
+
+| In stock | Suggested price |
+| --- | --- |
+| Under 1 year (`rules_mid_years`) | TCGplayer price, but never under a 25% margin (`rules_new_margin_pct`): raised above market if needed. |
+| 1 to 2 years | TCGplayer price, but never under a 15% margin (`rules_mid_margin_pct`). |
+| Over 2 years (`stale_years`): stale | 5 cents under market (`stale_under_market`), even below cost. |
+
+- Margin = profit as a % of the price, so a 25% margin on a cost of $46 means at least $61.33.
+- The price is moved to the nearest .99 when that is within 5% (`round_99`, `round_99_max_pct`) and doesn't
+  go under the margin. Stale prices only round down, so they stay under market. Prices under $1.50 aren't
+  rounded.
+- Without a cost in Shopify the margin can't be checked, so the suggestion is the market price. Without a
+  date in, the under-1-year rule is used.
+- For singles, "market" is the TCGplayer price adjusted for condition.
+- Only rows with a trusted TCGplayer price (OK, DRIFTING, URGENT) get a suggestion.
+- Slow sellers under a year are left to the operator: type a different price in "Update Shopify prices".
+
+### Date in and stale listings
+
+- Date in = the date received set by hand, else the day the listing (variant) was created in Shopify.
+  Shopify has no record of when stock arrived, so set a date received when a new shipment or reprint comes
+  in: select the rows, "Date in / stale...", type the date (or "Today"). That restarts the listing's age.
+- Stale = in stock for `stale_years` or more. "Date in / stale..." can also mark a listing "Stale now" or
+  "Not stale", or put it back to "By age". With several rows selected, whatever you leave unchanged keeps
+  each listing's own value.
+- Nothing about staleness changes a price in Shopify by itself: stale listings get a suggested price, and an
+  operator sends it.
+
 Double-click a row (or press Enter) to open it on TCGplayer. Symbols: star = presale, lightning =
-fast-moving, warning sign = TCGplayer price below our cost, pencil = price typed in with "Enter live
+fast-moving, hourglass = stale, warning sign = TCGplayer price below our cost, pencil = price typed in with "Enter live
 price...". A typed live price is used until a newer daily snapshot has a price for that product.
 
 Shortcuts: Cmd/Ctrl+F search, Esc clears the search, Cmd/Ctrl + / - / 0 change text size.
@@ -254,6 +300,7 @@ Top-level keys:
 | `settings` | See the table below. |
 | `overrides` | Saved choices per Shopify title (and optional `variant`): `tcg` (list of `category` / `group` / `product` TCGplayer IDs, plus `finish` for a single, e.g. `Foil`; several are averaged), `ignore` (hidden), `self_priced`, `presale`, `note`. These always win over automatic matching. |
 | `live_prices` | Prices typed in from TCGplayer: `shopify_title`, `variant`, `price`, `entered` (UTC time). |
+| `stock_dates` | Set with "Date in / stale...": `shopify_title`, `variant`, optional `received` (YYYY-MM-DD) and `stale` (`true` / `false`; absent = by age). |
 
 `settings` keys (most are editable in Settings):
 
@@ -276,6 +323,13 @@ Top-level keys:
 | `ignore_words` | sports-card brands etc. | Never match products whose title contains any of these (whole words); they are listed as NO PRICE SOURCE. |
 | `self_priced_words` | `damaged` | Treat as SELF-PRICED when the title contains any of these. |
 | `new_release_days` | `30` | Sets released within this many days are flagged fast-moving. |
+| `rules_new_margin_pct` | `25` | Pricing rules: minimum margin for stock under `rules_mid_years`. |
+| `rules_mid_years` | `1` | Pricing rules: age (years) where the second margin starts. |
+| `rules_mid_margin_pct` | `15` | Pricing rules: minimum margin from `rules_mid_years` until stale. |
+| `stale_years` | `2` | Stale from this age (years): suggested just under market, even at a loss. |
+| `stale_under_market` | `0.05` | Stale: dollars under the market price. |
+| `round_99` | `true` | End suggested prices in .99 when that's a small step. |
+| `round_99_max_pct` | `5` | Largest step (% of the price) for the .99 rounding (file only). |
 | `auto_match_score` | `0.75` | Minimum score for an automatic match (file only). |
 | `check_match_score` | `0.35` | Below this score a listing is NO MATCH (file only). |
 | `auto_match_max_diff_pct` | `75` | An automatic match this far from our price becomes CHECK MATCH (file only). |
@@ -310,7 +364,8 @@ CSV columns:
 | `kind` | `sealed`, `single` or `other` (no price source). |
 | `shopify_title`, `variant`, `type` | Shopify product title, variant, product type. |
 | `condition`, `finish` | Singles: condition code (NM, LP, MP, HP, DMG) and TCGplayer subtype used. |
-| `our_price`, `suggested_price` | Shopify price; suggested new price (URGENT / DRIFTING rows). |
+| `our_price`, `suggested_price`, `suggest_note` | Shopify price; suggested price under the pricing rules (OK / DRIFTING / URGENT rows) and the rule that set it. |
+| `date_in`, `age_days`, `stale` | Date in (date received set by hand, else Shopify listing date), days in stock since then, stale flag. |
 | `cost`, `margin_pct` | Cost per item, our margin %. |
 | `tcg_price`, `tcg_margin_pct`, `below_cost` | TCGplayer comparison price, margin at that price, whether it is below our cost. |
 | `diff_amt`, `diff_pct` | Our price minus TCGplayer, in dollars and %. |
