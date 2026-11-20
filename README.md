@@ -59,8 +59,9 @@ or run the script with Python.
   them with "Update Shopify prices...".
 - Date in and staleness: each listing's "date in" is the day it was created in Shopify, or a date received
   set by hand with "Date in / stale..." (set one when a new shipment or reprint comes in: it restarts the
-  age). Age column, stale flag (hourglass) and "Stale" filter; a listing can also be marked stale (or not
-  stale) by hand.
+  age). "In stock since" column right after the product name (month and age, e.g. `Mar '24 · 2y 8m`, with
+  an hourglass when stale; it never hides on a narrow window), stale flag and "Stale" filter; a listing can
+  also be marked stale (or not stale) by hand.
 - Stock: one column per store / warehouse plus their total, in the window and the reports, so every store
   can see what the others hold. Columns are set in Settings (`stock_columns`): by default Warehouse (Cash
   Cards Unlimited Warehouse + Relics Awakened), Frank and Son, Janss and Woodland Hills. Shopify locations
@@ -178,12 +179,15 @@ python3 tcg_price_checker.py --cli [--credentials PATH] [--shopify-csv EXPORT.cs
 | Show | Everything, Sealed, Singles or Other (no price source). |
 | Show out of stock | Off by default: listings with stock 0 or blank are hidden. The status line says how many. |
 
-Table columns: Status, Flags, Shopify product (title and variant), Our price, Cost, Our margin, TCG market
-(or TCG lowest), Margin at TCG, Difference, $ diff, Suggested (price under the pricing rules), Age (time in
-stock since the date in), Stock (total of the stock columns), one column per
+Table columns: Status, Flags, Shopify product (title and variant), In stock since (month of the date in and
+the age, e.g. `Mar '24 · 2y 8m`; hourglass = stale; click the heading to sort oldest first), Our price,
+Cost, Our margin, TCG market
+(or TCG lowest), Margin at TCG, Difference, $ diff, Suggested (price under the pricing rules), Stock (total
+of the stock columns), one column per
 stock column (see `stock_columns`), TCGplayer product, Match. Drag a heading to move a column; right-click
 a heading for "Reset column order". The order is saved when the window closes. On a narrow window the less important columns hide first
-(Match, Margin at TCG, Our margin, $ diff, Age, Cost, Flags, then the location columns); the details under the
+(Match, Margin at TCG, Our margin, $ diff, Cost, Flags, then the location columns; In stock since always
+stays); the details under the
 table always show everything, including the suggested price with the rule that set it, the date in, and
 each stock column.
 

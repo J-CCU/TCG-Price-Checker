@@ -1483,6 +1483,15 @@ def age_text(days):
     return f"{months // 12}y {months % 12}m" if months >= 12 else f"{months}m"
 
 
+def since_text(r):
+    """"Mar '24 · 2y 8m": the month a listing came in and how long ago, with ⌛ when it's stale."""
+    try:
+        day = dt.date.fromisoformat(r.get("date_in") or "")
+    except ValueError:
+        return ""
+    return ("⌛ " if r.get("stale") else "") + f"{day.strftime('%b')} '{day.strftime('%y')} · {age_text(r.get('age_days'))}"
+
+
 def ends_in_99(price, floor=None, allow_up=True, max_pct=5):
     """The nearest price ending in .99 (41.37 -> 40.99), if that's within max_pct of the price, not under
     the floor, and (allow_up=False) not above the price. Otherwise the price unchanged."""
@@ -2218,9 +2227,10 @@ def write_html(rows, path, settings, report_date, tcg_updated, locations=(), hid
         body.append(f"""<tr class="row-{tag_class(r['tag'])} row-{r.get('kind', 'sealed')}{' row-needupdate' if r['tag'] in NEED_UPDATE else ''}{' row-presale' if r['presale'] else ''}{' row-belowcost' if r['below_cost'] else ''}{' row-fast' if r['fast_moving'] else ''}{' row-stale' if r.get('stale') else ''}">
   <td><span class="tag t-{tag_class(r['tag'])}">{r['tag']}</span>{' <span class="tag t-presale">PRESALE</span>' if r['presale'] else ''}{' <span class="tag t-fast" title="Price can move a lot between daily snapshots - check live">⚡ FAST-MOVING</span>' if r['fast_moving'] else ''}{' <span class="tag t-stale" title="In stock past the stale age: priced to market even at a loss">⌛ STALE</span>' if r.get('stale') else ''}</td>
   <td><div class="title">{html.escape(r['shopify_title'])}{(' — ' + html.escape(r['variant'])) if r['variant'] else ''}</div>
-      <div class="sub">{r['channel']} · {html.escape(r['type'])}{(' · ' + html.escape(extra)) if extra else ''}{(' · in since ' + r['date_in'] + ' (' + age_text(r.get('age_days')) + ')') if r.get('date_in') else ''}</div>
+      <div class="sub">{r['channel']} · {html.escape(r['type'])}{(' · ' + html.escape(extra)) if extra else ''}</div>
       {f'<div class="sub">suggested {money(r["suggested_price"])}: {html.escape(r.get("suggest_note") or "")}</div>' if r.get('suggested_price') else ''}
       {f'<div class="sub">{html.escape(r["note"])}</div>' if r['note'] else ''}</td>
+  <td class="since{' stalecell' if r.get('stale') else ''}">{html.escape(since_text(r)) or '—'}{f'<div class="sub">{r["date_in"]}</div>' if r.get('date_in') else ''}</td>
   <td class="num">{money(r['our_price'])}{f'<div class="sub">was {money(r["compare_at"])}</div>' if r['compare_at'] else ''}</td>
   <td class="num">{money(r['cost'])}{f'<div class="sub">margin {r["margin_pct"]:.0f}%</div>' if r['margin_pct'] is not None else ''}</td>
   <td class="num">{money(r['tcg_price'])}{f'<div class="sub">typed in (snapshot {money(r["snapshot_price"])})</div>' if r['live_entered'] else ''}{f'<div class="sub">low {money(r["tcg_low"])}</div>' if r['tcg_low'] is not None else ''}{f'<div class="sub{" neg" if r["tcg_margin_pct"] < 0 else ""}">margin {r["tcg_margin_pct"]:.0f}%{" · below cost" if r["below_cost"] else ""}</div>' if r['tcg_margin_pct'] is not None else ''}</td>
@@ -2263,7 +2273,7 @@ th{{font-size:12px;color:var(--muted);font-weight:600;position:sticky;top:0;back
 .tag{{display:inline-block;font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;margin:0 4px 4px 0;white-space:nowrap}}
 .t-urgent{{background:var(--redbg);color:var(--red)}} .t-drifting{{background:var(--amberbg);color:var(--amber)}}
 .t-ok{{background:var(--greenbg);color:var(--green)}} .t-nodata,.t-selfpriced,.t-nomatch,.t-noprice{{background:var(--greybg);color:var(--grey)}}
-.t-presale,.t-fast{{background:var(--bluebg);color:var(--blue)}} .t-stale{{background:var(--amberbg);color:var(--amber)}} .t-checkmatch{{background:var(--bluebg);color:var(--blue);outline:1px dashed var(--blue)}}
+.t-presale,.t-fast{{background:var(--bluebg);color:var(--blue)}} .t-stale{{background:var(--amberbg);color:var(--amber)}} .since{{white-space:nowrap}} .stalecell{{color:var(--amber);font-weight:600}} .t-checkmatch{{background:var(--bluebg);color:var(--blue);outline:1px dashed var(--blue)}}
 a{{color:var(--blue)}}
 </style></head><body><main>
 <h1>Shopify vs TCGplayer — {report_date}</h1>
@@ -2274,7 +2284,7 @@ Singles: TCGplayer Near Mint price × condition ({", ".join(f"{k} {v:g}%" for k,
 <div class="filters"><button class="on" data-f="all">All ({len(rows)})</button><button data-f="needupdate">Need update ({need_count})</button>{buttons}<button data-f="sealed">Sealed ({kinds['sealed']})</button><button data-f="single">Singles ({kinds['single']})</button><button data-f="presale">Presale</button><button data-f="belowcost">TCGplayer below our cost</button><button data-f="fast">⚡ Fast-moving</button><button data-f="stale">⌛ Stale ({sum(1 for r in rows if r.get('stale'))})</button></div>
 <input class="search" type="search" placeholder="Search products…" aria-label="Search products">
 <div class="wrap"><table>
-<thead><tr><th>Tag</th><th>Shopify product</th><th class="num">Our price</th><th class="num">Cost</th><th class="num">TCGplayer</th><th class="num">Us vs TCG</th><th class="num">Stock</th>{loc_heads}<th>TCGplayer match</th></tr></thead>
+<thead><tr><th>Tag</th><th>Shopify product</th><th>In stock since</th><th class="num">Our price</th><th class="num">Cost</th><th class="num">TCGplayer</th><th class="num">Us vs TCG</th><th class="num">Stock</th>{loc_heads}<th>TCGplayer match</th></tr></thead>
 <tbody>{''.join(body)}</tbody></table></div>
 </main>
 <script>
@@ -2309,6 +2319,7 @@ COLUMNS = [  # id, heading, width (characters), anchor, sort key
     ("tag", "Status", 12, "w", lambda r: TAG_ORDER[r["tag"]]),
     ("flags", "Flags", 6, "center", lambda r: (not r["presale"], not r["fast_moving"])),
     ("product", "Shopify product", 44, "w", lambda r: r["shopify_title"].lower()),
+    ("since", "In stock since", 19, "w", lambda r: r.get("age_days") if r.get("age_days") is not None else -1),
     ("ours", "Our price", 9, "e", lambda r: r["our_price"] or 0),
     ("cost", "Cost", 9, "e", lambda r: r["cost"] or 0),
     ("margin", "Our margin", 9, "e", lambda r: r["margin_pct"] if r["margin_pct"] is not None else -1e9),
@@ -2317,7 +2328,6 @@ COLUMNS = [  # id, heading, width (characters), anchor, sort key
     ("diff", "Difference", 9, "e", lambda r: abs(r["diff_pct"] or 0)),
     ("amt", "$ diff", 9, "e", lambda r: abs(r["diff_amt"] or 0)),
     ("rule", "Suggested", 9, "e", lambda r: r.get("suggested_price") or 0),
-    ("age", "Age", 7, "e", lambda r: r.get("age_days") if r.get("age_days") is not None else -1),
     ("stock", "Stock", 6, "e", lambda r: r["stock"] if isinstance(r["stock"], (int, float)) else -1e9),
     ("match", "TCGplayer product", 32, "w", lambda r: r["tcg_name"].lower()),
     ("how", "Match", 10, "w", lambda r: r["match"]),
@@ -2325,7 +2335,7 @@ COLUMNS = [  # id, heading, width (characters), anchor, sort key
 FLEX_COLUMNS = {"product": 0.6, "match": 0.4}  # these two share whatever width is left
 FLEX_MIN_CHARS = {"product": 24, "match": 16}
 # on narrow windows these columns hide, first to last, so product names stay readable (details stay below)
-HIDE_WHEN_NARROW = ["how", "tcgmargin", "margin", "amt", "age", "cost", "flags", "LOCATIONS"]
+HIDE_WHEN_NARROW = ["how", "tcgmargin", "margin", "amt", "cost", "flags", "LOCATIONS"]  # "since" always shows
 
 
 def short_names(names, size=9):
@@ -2940,9 +2950,9 @@ class App(tk.Tk):
                  + ("✎" if r["live_entered"] else ""))
         at = r.get("locations")
         locs = tuple("" if at is None else at.get(n, 0) for n in self.locations)
-        return (r["tag"], flags, product, money(r["our_price"]), money(r["cost"]),
+        return (r["tag"], flags, product, since_text(r), money(r["our_price"]), money(r["cost"]),
                 margin(r["margin_pct"]), money(r["tcg_price"]), tcg_margin, pct(r["diff_pct"]), amt,
-                money(r.get("suggested_price")), age_text(r.get("age_days")),
+                money(r.get("suggested_price")),
                 stock_text(r["stock"])) + locs + (r["tcg_name"] or "—", r["match"])
 
     def _matches_filter(self, r, code):
@@ -3040,7 +3050,7 @@ class App(tk.Tk):
 
     def sort_by(self, cid):
         self.sort_reverse = (not self.sort_reverse if self.sort_key == cid
-                             else cid in ("diff", "amt", "ours", "tcg", "cost"))
+                             else cid in ("diff", "amt", "ours", "tcg", "cost", "since"))
         self.sort_key = cid
         self.refresh_table()
 
